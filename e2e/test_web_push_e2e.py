@@ -11,6 +11,7 @@ is on state: a service worker decision (`oc-push` message), a notification,
 a saved subscription. None waits on time.
 """
 import base64
+import collections
 import hashlib
 import http.server
 import json
@@ -275,6 +276,58 @@ def pw():
         yield p
 
 
+TRACE_MAX = 300   # the page events a failed test reports (the last ones)
+TRACE = collections.deque(maxlen=TRACE_MAX)
+PENDING = {}      # the page's requests with no answer yet -> their url
+TRACED = []       # the pages traced (the module's browser page stays across tests)
+
+
+def trace(page):
+    """A page's loads, failed requests and errors, for the report of a test that fails."""
+    def note(kind, detail):
+        TRACE.append(f"{time.time():.3f} {kind} {detail}")
+    def navigated(frame):
+        if frame == page.main_frame:
+            note("nav", frame.url)
+    def failed(r):
+        PENDING.pop(r, None)
+        note("failed", f"{r.method} {r.url} {r.failure}")
+    def console(m):
+        if m.type in ("error", "warning"):
+            note("console." + m.type, m.text[:TRACE_TEXT])
+    TRACED.append(page)
+    page.on("framenavigated", navigated)
+    page.on("domcontentloaded", lambda p: note("domcontentloaded", p.url))
+    page.on("load", lambda p: note("load", p.url))
+    page.on("request", lambda r: PENDING.__setitem__(r, f"{r.method} {r.url}"))
+    page.on("requestfinished", lambda r: PENDING.pop(r, None))
+    page.on("requestfailed", failed)
+    page.on("console", console)
+    page.on("pageerror", lambda e: note("pageerror", str(e)[:TRACE_TEXT]))
+
+
+TRACE_TEXT = 300   # characters kept of a message
+
+
+@pytest.fixture(autouse=True)
+def page_trace(request):
+    """On a failure: what the pages did last, what they still wait for, and their service worker."""
+    TRACE.clear()
+    PENDING.clear()
+    TRACED[:] = [p for p in TRACED if not p.is_closed()]
+    yield
+    rep = getattr(request.node, "rep_call", None)
+    if rep is None or not rep.failed:
+        return
+    print("--- page trace (last events)")
+    print("\n".join(TRACE))
+    print("--- requests still without an answer")
+    print("\n".join(PENDING.values()) or "(none)")
+    for page in list(TRACED):   # (the diagnostics' own tab joins the list)
+        if not page.is_closed():
+            print(sw_diagnostics(page))
+
+
 def chrome(pw):
     """Google Chrome with its own new profile, as a phone-sized window."""
     ctx = pw.chromium.launch_persistent_context(
@@ -282,6 +335,9 @@ def chrome(pw):
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
     ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
+    for page in ctx.pages:
+        trace(page)
+    ctx.on("page", trace)
     return ctx
 
 
