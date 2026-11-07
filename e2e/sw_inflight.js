@@ -21,4 +21,6 @@ ExtendableEvent.prototype.waitUntil = function (p) {
 self.addEventListener("message", (e) => {
   if (e.data && e.data.type === "oc-e2e-inflight")
     e.source.postMessage({ type: "oc-e2e-inflight", list: [...ocE2eInflight.values()] });
+  // A waiting worker asked to skip waiting again: does it take over with the page still open?
+  if (e.data && e.data.type === "oc-e2e-skip") e.waitUntil(self.skipWaiting());
 });
