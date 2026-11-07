@@ -194,7 +194,35 @@ def settled(page, check, arg=None):
         if page.evaluate(check, arg):
             return
         time.sleep(STATE_POLL_S)
+    print(sw_diagnostics(page))
     raise AssertionError("never settled: " + check[:120])
+
+
+SW_STATE = """async () => { const r = await navigator.serviceWorker.getRegistration('/');
+  const w = (x) => x && {state: x.state, url: x.scriptURL};
+  return JSON.stringify({controller: w(navigator.serviceWorker.controller), active: w(r?.active),
+    waiting: w(r?.waiting), installing: w(r?.installing), caches: await caches.keys(),
+    visible: document.visibilityState, url: location.href}); }"""
+
+
+def sw_diagnostics(page):
+    """A service worker that never settled (or a page it never updated): the page's view of its
+    registration and caches, and Chrome's (each version's status, its clients, running or not)."""
+    out = ["--- service worker diagnostics"]
+    try:
+        out.append("page: " + page.evaluate(SW_STATE))
+    except Exception as e:
+        out.append(f"page: {e}")
+    tab = page.context.new_page()
+    try:
+        tab.goto("chrome://serviceworker-internals")
+        tab.wait_for_function("() => document.body.innerText.length > 0", timeout=WAIT_MS)
+        out.append(tab.evaluate("() => document.body.innerText")[:DIAG_CHARS])
+    except Exception as e:
+        out.append(f"serviceworker-internals: {e}")
+    finally:
+        tab.close()
+    return "\n".join(out)
 
 
 def ready(page):
@@ -975,6 +1003,8 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
         menu.wait_for(timeout=WAIT_MS)
         page.wait_for_function("() => window.ocPushFolderMenuContract === 'ok'", timeout=WAIT_MS)
         assert menu.evaluate("(m) => m.dataset.ocPush") == "seen"
+        # The contract is known at once; the items come once the user's folders are read (a request).
+        menu.locator("[data-oc-push-item=mute]").wait_for(timeout=WAIT_MS)
         assert menu.evaluate(ITEMS) == ["New Chat", "Create Folder", "Mark all as read", "Mute folder",
                                         "Edit", "Export", "Delete"]
     finally:
@@ -1869,7 +1899,12 @@ def kept_then_fresh(page, gate, old, new):
     page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
     assert page.get_by_text(new).count() == 0
     gate.set()
-    page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
+    try:
+        page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
+    except Exception:
+        print(sw_diagnostics(page), "\nupdating pill:", page.locator(UPDATING_PILL).count(),
+              "| old shown:", page.get_by_text(old).count())
+        raise
     page.locator(UPDATING_PILL).wait_for(state="detached", timeout=WAIT_MS)
     page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
 
