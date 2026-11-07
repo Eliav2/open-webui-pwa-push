@@ -401,7 +401,7 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
     page.wait_for_url(f"**/c/{f_chat}*", timeout=WAIT_MS)
     page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'keep this text'", timeout=WAIT_MS)
     assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
-    assert "keep this text" in page.locator("#chat-input").inner_text()
+    assert page.locator("#chat-input").inner_text().strip() == "keep this text"   # once
     assert "not sent" in page.locator("#oc-push-notice").inner_text()
     assert not [m for m in history(token, f_chat)["messages"].values() if m.get("content") == "keep this text"]
 
@@ -682,10 +682,37 @@ def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
     page.wait_for_function("() => window.ocPushReply && window.ocPushReply.text === 'kept, not reloaded'", timeout=WAIT_MS)
     assert "/c/" + f_chat in page.url and "oc-reply" not in page.url
     page.wait_for_timeout(DRAFT_RESTORE_WAIT_MS)
-    assert "kept, not reloaded" in page.locator("#chat-input").inner_text(), "chat F's own draft replaced the reply"
+    assert page.locator("#chat-input").inner_text().strip() == "kept, not reloaded", \
+        "chat F's own draft replaced the reply, or it went in twice"
     assert page.evaluate("(c) => caches.open('oc-push-drafts').then(d => d.match('/oc-push/draft/' + c)).then(r => !r)", f_chat), \
         "the cached reply was kept after it was put in the box"
     assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+
+
+def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
+    """No Open WebUI window open: the service worker opens the chat in a new one (a full load), with the reply
+    that could not be sent waiting in its drafts cache and ?oc-reply=unsent. SvelteKit puts the URL it loaded back
+    after the page script took the query off, and a second run put the same text in the box again (TEXTTEXT).
+    Set up as the worker leaves it when the send fails (act(), the reply branch)."""
+    token = owui
+    chat, _ = new_chat(token, "stub", "Chat Once")
+    ctx = chrome(pw)
+    try:
+        ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
+        ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(BASE + "/")
+        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        page.evaluate("""([c, text]) => caches.open('oc-push-drafts').then((d) =>
+            d.put('/oc-push/draft/' + c, new Response(JSON.stringify({text, at: Date.now()}))))""", [chat, "only once"])
+        page.goto(f"{BASE}/c/{chat}?oc-reply=unsent")
+        page.wait_for_function("() => !!window.ocPushReply", timeout=WAIT_MS)
+        page.wait_for_timeout(DRAFT_RESTORE_WAIT_MS)   # Open WebUI has loaded the chat and handled its own draft
+        assert page.locator("#chat-input").inner_text().strip() == "only once"
+        assert "not sent" in page.locator("#oc-push-notice").inner_text()
+        assert "oc-reply" not in page.url
+    finally:
+        ctx.close()
 
 
 def sidebar_link(page, chat_id):

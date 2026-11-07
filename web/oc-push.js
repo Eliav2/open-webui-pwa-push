@@ -298,7 +298,10 @@
     if (!id || id !== chatIdNow() || !keptChats.has(id) || reading.get(id) > 0) return;
     if (sockets > 0 && !refreshedKept.has(id)) return;   // Open WebUI's refresh comes
     try { sessionStorage.setItem(FRESH_RELOAD, id); } catch (_) { return; }
-    location.reload();
+    // A reply from a notification waiting for this chat's box goes along (its ?oc-reply).
+    const reply = replyWaiting.get(id);
+    if (reply) location.replace(location.pathname + "?" + new URLSearchParams({ [REPLY_PARAM]: reply }) + location.hash);
+    else location.reload();
   });
 
   // --- In a chat: the mute bell, and a reply that came back from a notification.
@@ -528,19 +531,35 @@
 
   // A reply from a notification: "compose" focuses the message box, "unsent"
   // puts the text that could not be sent into it and says so.
+  // Each reply that could not be sent goes in the box once, whatever the URL says:
+  // a run claims its draft by the draft's id (its time, from an older worker)
+  // before it waits for anything, and a second run (SvelteKit puts back the
+  // ?oc-reply this script took off; another navigation) finds it claimed and
+  // does nothing. A claim that did not end in the box is given back.
+  const claimed = new Set();   // draft ids a run of this page holds or put in the box
+  // A reply waiting for its chat's box (locked while the chat is its kept copy): a
+  // reload into the chat's fresh copy (above) keeps its ?oc-reply.
+  const replyWaiting = new Map();   // chat -> mode
+  const REPLY_PARAM = "oc-reply";
   async function pendingReply() {
     const id = chatIdNow();
     const q = new URLSearchParams(location.search);
-    const mode = q.get("oc-reply");
+    const mode = q.get(REPLY_PARAM);
     if (!id || !mode) return;
-    q.delete("oc-reply");
+    q.delete(REPLY_PARAM);
     history.replaceState(history.state, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
-    let text = "", drafts = null;
+    let text = "", drafts = null, draft = null;
     const key = "/oc-push/draft/" + id;
     try {
       drafts = await caches.open("oc-push-drafts");
       const r = await drafts.match(key);
-      if (r) text = (await r.json()).text || "";
+      if (r) {
+        const d = await r.json();
+        draft = String(d.id ?? d.at);
+        if (claimed.has(draft)) return;   // another run has this reply
+        claimed.add(draft);
+        text = d.text || "";
+      }
     } catch (_) {}
     const box = await new Promise((ok) => {
       const find = () => document.querySelector("#chat-input");
@@ -550,7 +569,9 @@
       setTimeout(() => { o.disconnect(); ok(find()); }, 15000);
     });
     // A locked box (offline, or the chat still its kept copy) takes no text: wait.
+    replyWaiting.set(id, mode);
     if (box) await writable();
+    replyWaiting.delete(id);
     // Still this chat's box (the page may have gone to another chat meanwhile).
     const now = chatIdNow() === id ? document.querySelector("#chat-input") : null;
     let put = false;
@@ -565,7 +586,7 @@
     if (put) {
       await drafts?.delete(key).catch(() => {});
       notice("Your reply was not sent. It is in the message box.");
-    }
+    } else if (draft !== null) claimed.delete(draft);
     window.ocPushReply = { mode, text, put };
   }
 

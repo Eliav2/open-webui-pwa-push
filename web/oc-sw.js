@@ -276,7 +276,9 @@ async function act(action, data, reply) {
         // Not sent: the text waits for the chat page, which puts it in the
         // message box and says so. Never dropped.
         const drafts = await caches.open(DRAFTS);
-        await drafts.put("/oc-push/draft/" + data.chat_id, new Response(JSON.stringify({ text, at: Date.now() })));
+        // Its own id: the page puts each draft in the box once (oc-push.js pendingReply).
+        await drafts.put("/oc-push/draft/" + data.chat_id,
+          new Response(JSON.stringify({ text, at: Date.now(), id: crypto.randomUUID() })));
       }
     }
     await openChat(url + (url.includes("?") ? "&" : "?") + "oc-reply=" + (text ? "unsent" : "compose"));
