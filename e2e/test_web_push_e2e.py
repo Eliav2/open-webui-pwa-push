@@ -200,8 +200,15 @@ def settled(page, check, arg=None):
 
 
 def controlled(page):
-    """Waits until the service worker controls the page (its first load ran before it did)."""
+    """Waits until the service worker controls the page (its first load ran before it did). The
+    worker claims the pages open when it activates (oc-sw.js clients.claim()); a document that
+    began loading before then and came after the claim (a reload of a page whose app failed to
+    load) is controlled only from its next navigation, as the service worker lifecycle defines."""
     try:
+        settled(page, "() => navigator.serviceWorker.getRegistration('/').then((r) => !!(r && r.active))")
+        if not page.evaluate("() => !!navigator.serviceWorker.controller"):
+            note("controlled", "an active worker, this document not claimed: its next navigation")
+            page.reload()
         page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
     except Exception:
         print(sw_diagnostics(page))
