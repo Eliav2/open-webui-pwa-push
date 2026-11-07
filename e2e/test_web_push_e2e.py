@@ -2174,9 +2174,13 @@ PAGE_READS = """((max) => { const kept = []; const f = window.fetch;
 })(%d)""" % UNREAD_KEPT
 
 
+NEW_VERSION_ID = "1"   # Chrome's id for a fresh profile's second version of the worker (CDP)
+
+
 def waiting_after_close(ctx, page):
-    """A new worker still waiting: is the old one held by the page? The page closes, and Chrome's
-    own account of each version's status follows (CDP), for WAIT_MS."""
+    """A new worker still waiting: what holds the old one? Its unfinished events, the page's unread
+    bodies; then the new one asked to skip waiting again with the page open, and if it still waits,
+    the page closed. Chrome's own account of each version's status (CDP) throughout."""
     tab = ctx.new_page()   # about:blank keeps the browser up and carries the CDP session
     cdp = ctx.new_cdp_session(tab)
     cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: [
@@ -2192,12 +2196,25 @@ def waiting_after_close(ctx, page):
         note("probe", "unread bodies " + json.dumps(page.evaluate("() => window.ocE2eUnread ? window.ocE2eUnread() : 'no tracker'")))
     except Exception as e:
         note("probe", f"unread bodies: {e}")
-    note("probe", "page closing")
-    page.close()
-    end = time.time() + WAIT_MS / 1000
-    while time.time() < end and not any("activated" in t and t.split()[2] == "1" for t in TRACE if " version " in t):
-        tab.wait_for_timeout(STATE_POLL_S * 1000)   # CDP events arrive while Playwright waits
+    # The waiting worker skips waiting again, the page still open: taking over now means its first
+    # skipWaiting was missed; staying means the old worker is held by something no script sees.
+    page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.waiting?.postMessage({type: 'oc-e2e-skip'}))")
+    note("probe", "asked the waiting worker to skip waiting again (page open)")
+    if not took_over(tab):
+        note("probe", "still waiting with the page open; page closing")
+        page.close()
+        took_over(tab)
     note("probe", "done")
+
+
+def took_over(tab):
+    """Whether the new version reports activated (CDP), within WAIT_MS."""
+    end = time.time() + WAIT_MS / 1000
+    while time.time() < end:
+        if any(t.split()[2:4] == [NEW_VERSION_ID, "activated"] for t in TRACE if " version " in t):
+            return True
+        tab.wait_for_timeout(STATE_POLL_S * 1000)   # CDP events arrive while Playwright waits
+    return False
 
 
 @needs_offline
