@@ -56,12 +56,21 @@
   }
   const parse = (raw, empty) => { try { return JSON.parse(raw || empty) || JSON.parse(empty); } catch (_) { return JSON.parse(empty); } };
 
+  // A push service can retire a subscription the browser still holds (no
+  // pushsubscriptionchange): the function then remembers it in `gone` by this
+  // fingerprint (openclaw_web_push.py fingerprint()), and save() answers GONE
+  // instead of saving the dead one again.
+  const GONE = "gone", FINGERPRINT_CHARS = 32, HEX = 16, HEX_DIGITS = 2;
+  const fingerprint = async (endpoint) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(endpoint)))]
+    .map((b) => b.toString(HEX).padStart(HEX_DIGITS, "0")).join("").slice(0, FINGERPRINT_CHARS);
   async function save(sub) {
     const s = sub.toJSON();
+    const print = await fingerprint(s.endpoint);
     let result = "kept";
     let device = store.get("ocPushDevice");
     if (!device) { device = crypto.randomUUID(); store.set("ocPushDevice", device); }
     await updateValves((now) => {
+      if (parse(now.gone, "[]").includes(print)) { result = GONE; return {}; }
       let list = parse(now.subscriptions, "[]");
       if (list.some((x) => x.endpoint === s.endpoint)) return {};
       result = "saved";
@@ -90,9 +99,16 @@
       await sub.unsubscribe();
       sub = null;
     }
-    sub ||= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(VAPID) });
+    const subscribe = () => reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(VAPID) });
+    sub ||= await subscribe();
+    let result = await save(sub);
+    // Retired by the push service: a new subscription in its place.
+    if (result === GONE) {
+      await sub.unsubscribe();
+      result = await save(await subscribe());
+    }
     store.set("ocPushUser", user);
-    return save(sub);
+    return result;
   }
 
   // The permission prompt needs a click (iOS requires one).

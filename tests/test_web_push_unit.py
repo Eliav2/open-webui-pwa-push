@@ -1,6 +1,9 @@
 """The Web Push function (openclaw_web_push.py): title and link only, OpenClaw
 events only from the Pipe, and a real encrypted send (tests/web_push_roundtrip.py)."""
 import importlib.util
+import hashlib
+import asyncio
+import time
 import json
 import os
 import subprocess
@@ -211,7 +214,31 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(os.unlink, key.name)
         self.fn.valves = self.fn.Valves(VAPID_PRIVATE_KEY_FILE=key.name, VAPID_SUBJECT="mailto:a@example.com")
         self.sent = []
-        self.fn.send_all = lambda subs, body, topic, key, subject, chat_id: self.sent.append((subs, body, key, subject)) or set()
+        self.fn.send_all = lambda subs, body, topic, key, subject, chat_id, early=None: self.sent.append((subs, body, key, subject)) or set()
+
+    async def resend_case(self, refuse):
+        """event() with a send that the push service refuses (or not) for a just-saved subscription."""
+        calls = []
+
+        def send_all(subs, body, topic, key, subject, chat_id, early=None):
+            calls.append((body, early is not None))
+            if refuse and early is not None:
+                early.extend(subs)
+            return set()
+        self.fn.send_all = send_all
+        with mock.patch.object(web_push, "NEW_TOKEN_SETTLE_S", 0):   # no real wait in the test
+            await self.fn.event(finished(), __id__="web_push")
+            await asyncio.gather(*list(self.fn._pending))
+        return calls
+
+    async def test_a_refused_new_subscription_gets_the_notification_once_more(self):
+        """FCM refuses a token Chrome registered seconds ago, then takes it: the notification is sent
+        again once, when the subscription is NEW_TOKEN_SETTLE_S old; that send collects nothing more."""
+        (body1, collects1), (body2, collects2) = await self.resend_case(refuse=True)
+        self.assertEqual((body1, collects1, collects2), (body2, True, False))
+
+    async def test_no_second_send_when_the_first_went_through(self):
+        self.assertEqual(len(await self.resend_case(refuse=False)), 1)
 
     async def test_a_reply_is_sent_with_the_key_from_the_file(self):
         await self.fn.event(finished(), __id__="web_push")
@@ -246,7 +273,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(p.stop)
 
     async def test_no_subject_and_a_plain_http_webui_url_sends_nothing_and_says_why(self):
-        """W7's G1: an http WEBUI_URL is no subject. Nothing is sent (it would fail at the push service),
+        """An http WEBUI_URL is no subject. Nothing is sent (it would fail at the push service),
         the user's push_problem says why (the page shows it) and the log says so once, as an error."""
         self.fn.valves.VAPID_SUBJECT = ""
         self.webui_url("http://localhost:3000")
@@ -361,10 +388,73 @@ class RoundTripTests(unittest.TestCase):
         res = self.run_scenario("gone")
         self.assertEqual(len(res["received"]), 2)
         self.assertEqual(res["left"], ["dev2"], "410 dropped, 500 kept")
+        self.assertEqual(len(res["gone"]), 1, "and remembered, so the page replaces it")
+
+    def test_a_new_token_refused_once_gets_the_notification_exactly_once(self):
+        """FCM's settle window: 410 for the just-saved token, then 201. The function keeps it and sends
+        that notification once more (NEW_TOKEN_SETTLE_S, 0 here): delivered once, nothing sent a third time."""
+        res = self.run_scenario("settle")
+        self.assertEqual([a["status"] for a in res["answers"] if a["device"] == "dev1"], [410, 201])
+        self.assertEqual([a["status"] for a in res["answers"] if a["device"] == "dev2"], [201], "the older one: once")
+        self.assertEqual(res["left"], ["dev1", "dev2"])
+        self.assertEqual(res["gone"], [])
+
+    def test_a_410_for_a_subscription_saved_moments_ago_keeps_it(self):
+        """FCM answers 410 for a token Chrome registered seconds ago (measured: 410 one to two seconds
+        after the save, then pushes go through), so a new subscription is not dropped for it."""
+        res = self.run_scenario("gone-new")
+        self.assertEqual(res["left"], ["dev1", "dev2"])
+        self.assertEqual(res["gone"], [])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoneTests(unittest.IsolatedAsyncioTestCase):
+    """A push service can retire a token the browser still holds (Chrome lists it, no
+    pushsubscriptionchange): the page would save that dead one again on every load. So the function
+    remembers each gone endpoint by fingerprint (`gone`), and the page replaces such a subscription."""
+
+    def functions(self, valves):
+        store = {"v": valves}
+
+        class Functions:
+            @staticmethod
+            async def get_user_valves_by_id_and_user_id(fid, user_id):
+                return store["v"]
+
+            @staticmethod
+            async def update_user_valves_by_id_and_user_id(fid, user_id, v):
+                store["v"] = v
+        return Functions, store
+
+    async def test_a_gone_endpoint_is_dropped_and_its_fingerprint_kept(self):
+        keys = {"p256dh": "k", "auth": "a"}
+        subs = [{"endpoint": "https://push.example/dead", "keys": keys, "device": "d1"},
+                {"endpoint": "https://push.example/ok", "keys": keys, "device": "d2"}]
+        Functions, store = self.functions({"subscriptions": json.dumps(subs), "mutes": "{}"})
+        await web_push.Event()._drop(Functions, "web_push", "u1", {"https://push.example/dead"})
+        self.assertEqual([s["device"] for s in json.loads(store["v"]["subscriptions"])], ["d2"])
+        self.assertEqual(json.loads(store["v"]["gone"]), [web_push.fingerprint("https://push.example/dead")])
+        self.assertEqual(store["v"]["mutes"], "{}", "other valves kept")
+        # The same endpoint again (the page saved the dead one before it knew): one entry.
+        store["v"]["subscriptions"] = json.dumps(subs)
+        await web_push.Event()._drop(Functions, "web_push", "u1", {"https://push.example/dead"})
+        self.assertEqual(len(json.loads(store["v"]["gone"])), 1)
+
+    async def test_the_list_keeps_the_most_recent(self):
+        Functions, store = self.functions({"subscriptions": "[]"})
+        for i in range(web_push.GONE_KEEP + 3):
+            await web_push.Event()._drop(Functions, "web_push", "u1", {f"https://push.example/{i}"})
+        gone = json.loads(store["v"]["gone"])
+        self.assertEqual(len(gone), web_push.GONE_KEEP)
+        self.assertEqual(gone[-1], web_push.fingerprint(f"https://push.example/{web_push.GONE_KEEP + 2}"))
+
+    def test_the_fingerprint_is_the_pages(self):
+        """web/oc-push.js computes the same: SHA-256 hex of the endpoint, its first FINGERPRINT_CHARS."""
+        self.assertEqual(web_push.fingerprint("https://push.example/x"),
+                         hashlib.sha256(b"https://push.example/x").hexdigest()[:web_push.FINGERPRINT_CHARS])
 
 
 class NotificationImageTests(unittest.TestCase):

@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -37,7 +38,11 @@ def device():
 def main(scenario: str) -> None:
     devices = {name: device() for name in ("dev1", "dev2")}
     status = {"dev1": 201, "dev2": 201} if scenario == "ok" else {"dev1": 410, "dev2": 500}
+    # "settle": dev1 is a token the push service does not take yet: 410 once, then 201 (FCM's settle window)
+    if scenario == "settle":
+        status = {"dev1": [410, 201], "dev2": 201}
     received = []
+    answers = []
 
     class PushService(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -49,7 +54,9 @@ def main(scenario: str) -> None:
                              "headers": {k: self.headers.get(k) for k in
                                          ("TTL", "Urgency", "Topic", "Content-Encoding")},
                              "vapid": (self.headers.get("Authorization") or "").split(" ")[0]})
-            self.send_response(status[name])
+            code = status[name].pop(0) if isinstance(status[name], list) else status[name]
+            answers.append({"device": name, "status": code})
+            self.send_response(code)
             self.end_headers()
 
         def log_message(self, *a):
@@ -60,7 +67,9 @@ def main(scenario: str) -> None:
     base = f"http://127.0.0.1:{server.server_address[1]}/push"
 
     store = {"subscriptions": json.dumps([
-        {"endpoint": f"{base}/{name}", "keys": {"p256dh": b64(pub), "auth": b64(auth)}, "device": name}
+        {"endpoint": f"{base}/{name}", "keys": {"p256dh": b64(pub), "auth": b64(auth)}, "device": name,
+         # "gone-new": saved by the page a moment ago (its `at`, milliseconds), as a token FCM does not take yet
+         **({"at": int(time.time() * 1000)} if scenario == "gone-new" or (scenario == "settle" and name == "dev1") else {})}
         for name, (_, auth, pub) in devices.items()])}
 
     class Functions:
@@ -93,10 +102,16 @@ def main(scenario: str) -> None:
     event = {"event": "chat.finished", "source": "openclaw-pipe", "actor": {"id": "u1"},
              "data": {"user_id": "u1", "chat_id": "c1", "message_id": "m1", "model_id": "openclaw_gateway.main",
                       "title": "Trip plan", "url": "https://chat.example.com/c/c1", "message": REPLY}}
-    asyncio.run(fn.event(event, __id__="web_push"))
+    mod.NEW_TOKEN_SETTLE_S = 0   # no real wait in the test
+
+    async def run():
+        await fn.event(event, __id__="web_push")
+        await asyncio.gather(*list(fn._pending))   # the resend, if any
+    asyncio.run(run())
     server.shutdown()
     print(json.dumps({"received": sorted(received, key=lambda r: r["device"]),
-                      "left": [s["device"] for s in json.loads(store["subscriptions"])]}))
+                      "left": [s["device"] for s in json.loads(store["subscriptions"])],
+                      "gone": json.loads(store.get("gone") or "[]"), "answers": answers}))
 
 
 if __name__ == "__main__":

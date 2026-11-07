@@ -278,7 +278,8 @@ Each user's own valves of the function are in a chat's **Controls** (the sliders
 - **A new service worker** takes over by itself, on the next page load or when an app left open comes back to the front. Nothing to clear or reinstall.
 - **After an Open WebUI update**, Open WebUI removes every service worker. The next time you open it on a device, it registers again with a new subscription, which replaces the old one. Replies that finish before that are not notified on that device.
 - **Another user on the same device:** when someone else signs in, the page script drops the old subscription and makes a new one for them. Signing out alone does not.
-- **Gone subscriptions:** a device whose push service answers 404 or 410 is removed from the user's list.
+- **Gone subscriptions:** a device whose push service answers 404 or 410 is removed from the user's list, and its next page load makes a new subscription in place of the dead one the browser may still hold. A subscription less than 10 minutes old is kept instead: Chrome's push service (FCM) refuses a brand-new one for a few seconds.
+- **A brand-new device may get its first notification about 30 s late:** that's FCM taking the new subscription; the function sends a notification it refused once more when the subscription is 30 s old.
 - **Tap to open:** a tap focuses an open Open WebUI window and opens the chat inside it, as a click in the sidebar does (no reload), or opens a new window when none is open.
 - **The log:** what the function did is in Open WebUI's log, each line ending with the chat's id (`web push: sent to fcm.googleapis.com chat_id=…`, `web push: chat is muted, nothing sent chat_id=…`).
 
@@ -304,6 +305,7 @@ Only `GET` requests to your own Open WebUI; everything else goes straight to the
 - **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your user valves and write them all back, because Open WebUI's user-valve update replaces the whole set. Two writers at once (two devices, two tabs) can put back the other's old value. If a mute did not stick, change it again.
 - **Open WebUI 0.13.0's pages.** The menu items are found by the structure and icons of Open WebUI 0.13.0's menus, not by their text (they are translated). A later version that draws them differently gets no items, and the console says once which menu it did not recognise. `e2e/` checks this contract against the pinned version.
 - **Safari tabs** get nothing ([iPhone and iPad](#iphone-and-ipad)).
+- **A push the push service accepted is its to deliver.** If the device's own connection to it is not up yet (seen once on a freshly reset Android Chrome), the notification comes late or not at all; the function is not told and sends nothing again.
 
 ## Turning it off
 

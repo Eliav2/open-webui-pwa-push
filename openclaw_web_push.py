@@ -2,7 +2,7 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.5.0
+version: 0.6.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
@@ -47,6 +47,26 @@ NO_SUBJECT = ("Notifications can't be sent yet: the admin must set VAPID_SUBJECT
 PUSH_REQUEST_TIMEOUT_S = 10
 # The push service says the subscription is gone (RFC 8030 section 7.3): drop it.
 GONE_STATUSES = (404, 410)
+# A gone endpoint is also remembered, by fingerprint, in the user's `gone` valve: the browser may
+# still hold that subscription (a push service can retire a token the browser never hears about),
+# and the page then replaces it instead of saving the dead one again on every load.
+# The most recent ones: a user has a few devices, each replacing its subscription now and then
+# (a new profile, Open WebUI's update path), so 20 covers every one the page could still hold.
+GONE_KEEP = 20
+# Except a young subscription: FCM answers 404/410 for a token Chrome has just registered, then
+# takes it. Measured in this repo's e2e (fresh profiles): 410 at +1, +2 and +4.5 s after the page
+# saved it, the last after a push to it had gone through; procrastimate#255 saw up to ~25 s;
+# reTerminal-eink-signage#11 keeps subscriptions younger than 10 min for the same reason. Dropping
+# one would leave that device without notifications until its page saves it again: it is kept,
+# and only a 404/410 once it is this old drops it.
+YOUNG_SUBSCRIPTION_S = 600
+# A notification refused that way is sent once more when the subscription is this old: past every
+# offset above (FCM gives no signal that it has taken the token, only time), so the user's first
+# notification after turning them on comes about this late instead of never. One resend per
+# notification, no ladder: a second refusal is logged and the next notification tries again.
+NEW_TOKEN_SETTLE_S = 30
+MS = 1000                 # the page's `at`: Date.now(), milliseconds
+FINGERPRINT_CHARS = 32    # hex digits of the endpoint's SHA-256 (web/oc-push.js computes the same)
 # The notification's buttons the service worker knows (web/oc-sw.js):
 # reply in the shade, mark the chat read, mute it for 8 hours.
 KNOWN_ACTIONS = ("reply", "read", "mute")
@@ -296,6 +316,10 @@ class Event:
             default=True,
             description="A notification swiped away marks its chat read (Android Chrome; "
                         "'Clear all' marks every chat in it read). Off: a swipe only hides it.")
+        gone: str = Field(
+            default="[]",
+            description="Written by the function: fingerprints of this user's subscriptions the push "
+                        "service says are gone. The page replaces such a subscription. Not set by hand.")
         push_problem: str = Field(
             default="",
             description="Written by the function: why it cannot send your notifications (empty: it "
@@ -304,6 +328,7 @@ class Event:
     def __init__(self):
         self.valves = self.Valves()
         self._subject_logged = False   # the missing subject's error, once per load of the function
+        self._pending = set()          # notifications to send again (_resend)
 
     async def event(self, event: dict, __id__: str = "", **kwargs):
         prefixes = [p.strip() for p in self.valves.PIPE_MODEL_PREFIXES.split(",") if p.strip()]
@@ -344,10 +369,23 @@ class Event:
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
                                             swipe_read=is_on(valves.get("swipe_read"), True),
                                             icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE))
+        early = []
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
-                                       key, subject, chat_id)
+                                       key, subject, chat_id, early)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
+        if early:
+            task = asyncio.create_task(self._resend(early, body, topic_for(chat_id), key, subject, chat_id))
+            self._pending.add(task)   # held until done: the loop keeps only weak references
+            task.add_done_callback(self._pending.discard)
+
+    async def _resend(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str) -> None:
+        """Once, when the youngest of these just-saved subscriptions is NEW_TOKEN_SETTLE_S old. A second
+        refusal is only logged (send_all without `early`): the next notification tries again."""
+        youngest = max((s.get("at") or 0) / MS for s in subs)
+        await asyncio.sleep(max(0.0, youngest + NEW_TOKEN_SETTLE_S - time.time()))
+        log.info("web push: sending again to %d just-saved subscription(s) chat_id=%s", len(subs), chat_id)
+        await asyncio.to_thread(self.send_all, subs, body, topic, key, subject, chat_id)
 
     @staticmethod
     async def _muted_folder(raw, chat_id: str, user_id: str):
@@ -393,10 +431,12 @@ class Event:
                       "function's valves.", url, problem)
         return ""
 
-    def send_all(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str) -> set:
+    def send_all(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str,
+                 early: list | None = None) -> set:
         """Send `body` to each subscription; returns the endpoints the push
         service says are gone. `key`: the VAPID private key, PEM. Each line
-        ends with `chat_id=<id>`, which central logs index (ELI-368)."""
+        ends with `chat_id=<id>`, which central logs index (ELI-368). `early`:
+        collects the just-saved subscriptions that were refused (sent again later)."""
         from py_vapid import Vapid
         from pywebpush import WebPushException, webpush
 
@@ -416,7 +456,14 @@ class Event:
                 log.info("web push: sent to %s chat_id=%s", _host(sub), chat_id)
             except WebPushException as ex:
                 status = getattr(ex.response, "status_code", None)
-                if status in GONE_STATUSES:
+                age = time.time() - (sub.get("at") or 0) / MS
+                if status in GONE_STATUSES and age < YOUNG_SUBSCRIPTION_S:
+                    log.warning("web push: %s answered %s for a subscription saved %d s ago: kept (a new token "
+                                "is not taken everywhere at once)%s chat_id=%s", _host(sub), status, age,
+                                ", sent again later" if early is not None else "", chat_id)
+                    if early is not None:
+                        early.append(sub)
+                elif status in GONE_STATUSES:
                     gone.add(sub["endpoint"])
                     log.info("web push: subscription gone (%s), dropping %s chat_id=%s", status, _host(sub), chat_id)
                 else:
@@ -430,8 +477,24 @@ class Event:
         valves = await Functions.get_user_valves_by_id_and_user_id(fid, user_id) or {}
         subs = parse_subscriptions(valves.get("subscriptions"))
         keep = [s for s in subs if s["endpoint"] not in gone]
-        if len(keep) != len(subs):
-            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {**valves, "subscriptions": json.dumps(keep)})
+        prints = parse_list(valves.get("gone"))
+        new = [fingerprint(e) for e in sorted(gone) if fingerprint(e) not in prints]
+        if len(keep) != len(subs) or new:
+            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {
+                **valves, "subscriptions": json.dumps(keep), "gone": json.dumps((prints + new)[-GONE_KEEP:])})
+
+
+def fingerprint(endpoint: str) -> str:
+    """The endpoint as the page compares it, without storing the token itself once more."""
+    return hashlib.sha256(endpoint.encode()).hexdigest()[:FINGERPRINT_CHARS]
+
+
+def parse_list(raw) -> list:
+    try:
+        v = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
 def _host(sub: dict) -> str:

@@ -11,9 +11,11 @@ is on state: a service worker decision (`oc-push` message), a notification,
 a saved subscription. None waits on time.
 """
 import base64
+import hashlib
 import http.server
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -36,6 +38,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CHROME = os.environ.get("E2E_CHROME", "/usr/bin/google-chrome")
 WAIT_MS = 60000  # a safety net for each state wait, never expected to expire
+DIAG_LOG_S = 300    # push_diagnostics: the function's log lines of the last 5 minutes
+DIAG_CHARS = 6000   # and at most this much of each chrome:// page
+FINGERPRINT_CHARS = 32   # openclaw_web_push.py's: the same fingerprints as its `gone` valve
 CHAT_LOAD_DELAY_MS = 200  # chat F arrives just after the reply is in the box (inside Open WebUI's 500 ms draft-save debounce)
 MENU_DRAWN_WAIT_MS = 500  # a few frames: the script adds its item on the frame after the menu appears
 DRAFT_RESTORE_WAIT_MS = 4000  # Open WebUI has loaded the chat and handled its own draft by then
@@ -112,10 +117,50 @@ NOTES = "async () => (await (await navigator.serviceWorker.ready).getNotificatio
 CLEAR = "async () => (await (await navigator.serviceWorker.ready).getNotifications()).forEach(n => n.close())"
 
 
+# A push to a just-saved subscription can come NEW_TOKEN_SETTLE_S late: FCM refuses a brand-new token
+# for a few seconds and the function sends that notification again once the token is this old.
+NEW_TOKEN_SETTLE_S = int(re.search(r"^NEW_TOKEN_SETTLE_S = (\d+)$", open(os.path.join(ROOT, "openclaw_web_push.py")).read(),
+                                   re.M).group(1))
+PUSH_DELIVERY_S = 30   # FCM to Chrome once it has taken the token: a safety net, never expected to expire
+PUSH_WAIT_MS = (NEW_TOKEN_SETTLE_S + PUSH_DELIVERY_S) * 1000
+
+
 def seen_for(page, chat_id, n=1):
-    page.wait_for_function("([c, n]) => (window.ocPushSeen || []).filter(d => d.payload.chat_id === c).length >= n",
-                           arg=[chat_id, n], timeout=WAIT_MS)
+    try:
+        page.wait_for_function("([c, n]) => (window.ocPushSeen || []).filter(d => d.payload.chat_id === c).length >= n",
+                               arg=[chat_id, n], timeout=PUSH_WAIT_MS)
+    except Exception:
+        print(push_diagnostics(page))
+        raise
     return page.evaluate("(c) => window.ocPushSeen.filter(d => d.payload.chat_id === c)", chat_id)
+
+
+def fingerprint(endpoint):
+    """A push endpoint, short and comparable, without the token itself in the output."""
+    return hashlib.sha256(endpoint.encode()).hexdigest()[:FINGERPRINT_CHARS] if endpoint else "none"
+
+
+def push_diagnostics(page):
+    """A push that never came: Chrome's own view of push (its registrations and their log, what it
+    received) and of the service workers, with this page's subscription, for the failure's output."""
+    endpoint = page.evaluate(ENDPOINT)
+    valves = api("/api/v1/functions/id/web_push/valves/user", token=page.evaluate("() => localStorage.getItem('token')"))
+    saved = json.loads(valves.get("subscriptions") or "[]")
+    out = ["--- push diagnostics", "page subscription: " + fingerprint(endpoint),
+           "saved subscriptions: " + ", ".join(fingerprint(x["endpoint"]) for x in saved),
+           "gone (the function's 404/410s): " + ", ".join(json.loads(valves.get("gone") or "[]")),
+        "function log: " + "\n".join(l for l in owui_log(time.time() - DIAG_LOG_S).split("\n") if "web push" in l)]
+    for url in ("chrome://gcm-internals", "chrome://serviceworker-internals"):
+        tab = page.context.new_page()
+        try:
+            tab.goto(url)
+            tab.wait_for_function("() => document.body.innerText.length > 0", timeout=WAIT_MS)
+            out += ["--- " + url, tab.evaluate("() => document.body.innerText")[:DIAG_CHARS]]
+        except Exception as e:
+            out.append(f"--- {url}: {e}")
+        finally:
+            tab.close()
+    return "\n".join(out)
 
 
 def behind(ctx, page):
@@ -256,6 +301,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
     assert page.evaluate("() => window.ocPushState") == "saved"
     (sub,) = subscriptions(token, page)
+    print("step 1 saved", fingerprint(sub["endpoint"]), time.strftime("%H:%M:%S"))   # for push_diagnostics
     assert sub["endpoint"].startswith("https://fcm.googleapis.com/"), sub["endpoint"][:40]
     assert sub["keys"]["p256dh"] and sub["device"]
     push_connection_live(ctx, BASE)
@@ -305,6 +351,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     page.goto(BASE + "/")
     assert ready(page) == "saved"
     (sub2,) = subscriptions(token, page)
+    print("step 4 saved", fingerprint(sub2["endpoint"]), time.strftime("%H:%M:%S"))
     assert sub2["endpoint"] != sub["endpoint"] and sub2["device"] == sub["device"]
     push_connection_live(ctx, BASE)
     other()
@@ -312,6 +359,39 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     reply(token, "stub", d_chat, d_msg)
     (d,) = seen_for(page, d_chat)
     assert d["shown"]
+
+
+def test_a_subscription_the_push_service_retired_is_replaced_on_the_next_load(owui, browser):
+    """A push service can retire a subscription the browser keeps (Chrome still lists it, no
+    pushsubscriptionchange). The function then drops it and remembers its fingerprint in `gone`
+    (GoneTests; the round trip with a real 410); the page's next load replaces it instead of saving
+    the dead one again, and pushes come through. Here the function's record is written as it writes
+    it, for the subscription this browser holds and still believes in."""
+    ctx, page = browser
+    token = owui
+    page.bring_to_front()
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    (old,) = subscriptions(token, page)
+    v = api(VALVES_READ, token=token)
+    api(VALVES_READ + "/update", {**v, "gone": json.dumps([fingerprint(old["endpoint"])]), "subscriptions": json.dumps(
+        [s for s in json.loads(v["subscriptions"]) if s["endpoint"] != old["endpoint"]])}, token)
+    page.goto(BASE + "/")
+    assert ready(page) == "saved"
+    (new,) = subscriptions(token, page)
+    assert new["endpoint"] != old["endpoint"] and new["device"] == old["device"]
+    assert page.evaluate(ENDPOINT) == new["endpoint"], "the page holds the new one"
+    push_connection_live(ctx, BASE)
+    behind(ctx, page)
+    r_chat, r_msg = new_chat(token, "stub", "Chat Replaced")
+    reply(token, "stub", r_chat, r_msg)
+    (d,) = seen_for(page, r_chat)
+    assert d["shown"]
+    page.evaluate(CLEAR)
+    page.bring_to_front()
+
+
+ENDPOINT = "async () => (await (await navigator.serviceWorker.getRegistration('/'))?.pushManager.getSubscription())?.endpoint"
 
 
 def history(token, chat_id):
