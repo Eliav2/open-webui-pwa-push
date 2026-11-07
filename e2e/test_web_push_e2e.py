@@ -280,12 +280,32 @@ TRACE_MAX = 300   # the page events a failed test reports (the last ones)
 TRACE = collections.deque(maxlen=TRACE_MAX)
 PENDING = {}      # the page's requests with no answer yet -> their url
 TRACED = []       # the pages traced (the module's browser page stays across tests)
+SW_PENDING = {}   # the service workers' own requests with no answer yet -> when and what
+
+
+def note(kind, detail):
+    TRACE.append(f"{time.time():.3f} {kind} {detail}")
+
+
+def asked(r):
+    return f"{time.time():.3f} {r.method} {r.url}"
+
+
+def trace_workers(ctx):
+    """The service workers' own requests (to the network), beside the pages'."""
+    def started(r):
+        if r.service_worker is not None:
+            SW_PENDING[r] = asked(r)
+    def failed(r):
+        if SW_PENDING.pop(r, None) is not None:
+            note("sw.failed", f"{r.method} {r.url} {r.failure}")
+    ctx.on("request", started)
+    ctx.on("requestfinished", lambda r: SW_PENDING.pop(r, None))
+    ctx.on("requestfailed", failed)
 
 
 def trace(page):
     """A page's loads, failed requests and errors, for the report of a test that fails."""
-    def note(kind, detail):
-        TRACE.append(f"{time.time():.3f} {kind} {detail}")
     def navigated(frame):
         if frame == page.main_frame:
             note("nav", frame.url)
@@ -299,7 +319,7 @@ def trace(page):
     page.on("framenavigated", navigated)
     page.on("domcontentloaded", lambda p: note("domcontentloaded", p.url))
     page.on("load", lambda p: note("load", p.url))
-    page.on("request", lambda r: PENDING.__setitem__(r, f"{r.method} {r.url}"))
+    page.on("request", lambda r: PENDING.__setitem__(r, asked(r)))
     page.on("requestfinished", lambda r: PENDING.pop(r, None))
     page.on("requestfailed", failed)
     page.on("console", console)
@@ -314,6 +334,7 @@ def page_trace(request):
     """On a failure: what the pages did last, what they still wait for, and their service worker."""
     TRACE.clear()
     PENDING.clear()
+    SW_PENDING.clear()
     TRACED[:] = [p for p in TRACED if not p.is_closed()]
     yield
     rep = getattr(request.node, "rep_call", None)
@@ -323,6 +344,8 @@ def page_trace(request):
     print("\n".join(TRACE))
     print("--- requests still without an answer")
     print("\n".join(PENDING.values()) or "(none)")
+    print("--- the service workers' requests still without an answer")
+    print("\n".join(SW_PENDING.values()) or "(none)")
     for page in list(TRACED):   # (the diagnostics' own tab joins the list)
         if not page.is_closed():
             print(sw_diagnostics(page))
@@ -338,6 +361,7 @@ def chrome(pw):
     for page in ctx.pages:
         trace(page)
     ctx.on("page", trace)
+    trace_workers(ctx)
     return ctx
 
 
@@ -2102,8 +2126,10 @@ def test_a_sign_out_drops_the_kept_chats(owui, pw):
 
 def worker_offline(value):
     """The stack Worker's OFFLINE var, the Worker restarted with it (stack.sh offline)."""
+    note("worker", f"OFFLINE={value}: restarting")
     subprocess.run(["bash", os.path.join(HERE, "stack.sh"), "offline", os.environ["E2E_RUN"], value],
                    check=True, capture_output=True, timeout=WAIT_MS / 1000)
+    note("worker", f"OFFLINE={value}: up")
     assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
 
 
