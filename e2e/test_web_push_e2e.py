@@ -1696,7 +1696,11 @@ def test_the_kept_app_runs_while_the_version_check_gets_no_answer(owui, browser)
     chat, _ = new_chat(owui, "stub", "Chat Silent")
     warm(page, chat)
     silent = threading.Event()
-    srv = slow_server(lambda path: (b"{}", "application/json"), gate=silent)
+    # Let go at the end with the server's own version, as the kept app's: any other answer is a
+    # new Open WebUI to the worker, which drops every cache and reloads the page into the next test.
+    with urllib.request.urlopen(BASE + "/api/version", timeout=30) as r:
+        same = r.read()
+    srv = slow_server(lambda path: (same, "application/json"), gate=silent)
     def no_answer(route):
         if route.request.service_worker is None:
             return route.fallback()
