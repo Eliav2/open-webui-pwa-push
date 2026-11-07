@@ -727,12 +727,22 @@ def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
         ctx.close()
 
 
+# Open WebUI 0.13's "Open Sidebar" buttons: the chat navbar's on a phone-sized window
+# (#sidebar-toggle-button, only on a chat), the sidebar rail's on a wide one (#sidebar-open-button).
+OPEN_SIDEBAR = "[...document.querySelectorAll('button[aria-label^=\"Open Sidebar\"]')].filter((b) => b.checkVisibility())"
+
+
 def sidebar_link(page, chat_id):
-    """A chat's entry in the sidebar, the sidebar opened (a phone-sized window keeps it closed)."""
+    """A chat's entry in the sidebar, the sidebar opened. Whether the sidebar starts open is Open
+    WebUI's own saved state (localStorage.sidebar), which earlier tests leave either way: waits for
+    the entry or a closed sidebar, then opens it with the button this layout shows."""
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # Open WebUI drawn
-    if not page.locator(f'a[href="/c/{chat_id}"]').is_visible():
-        page.locator("#sidebar-toggle-button").first.click()
-    return page.locator(f'a[href="/c/{chat_id}"]')
+    link = page.locator(f'a[href="/c/{chat_id}"]')
+    page.wait_for_function(f"""(c) => document.querySelector(`a[href="/c/${{c}}"]`)?.checkVisibility()
+        || {OPEN_SIDEBAR}.length > 0""", arg=chat_id, timeout=WAIT_MS)
+    if not link.is_visible():
+        page.locator('button[aria-label^="Open Sidebar"]').filter(visible=True).first.click()
+    return link
 
 
 def chat_menu(page, chat_id):
@@ -844,6 +854,51 @@ FOLDER_ROW_TRIGGER = "document.getElementById('folder-' + arg + '-button').query
 CHAT_TRIGGER = """(() => { let box = document.querySelector('a[href="/c/' + arg + '"]'), b = null;
     while (box && !(b = box.querySelector('button[aria-haspopup]'))) box = box.parentElement; return b; })()"""
 ITEMS = "(m) => [...m.querySelectorAll('.app-dropdown-menu > button[role=menuitem]')].map(b => b.textContent.trim())"
+
+
+def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
+    """A phone and a real touch: the tap on a folder's ⋯ in the sidebar lands on the folder's link
+    (Open WebUI makes it a menu trigger too, aria-haspopup), not on the ⋯ button, and the same folder
+    menu opens. The page script must know it is that folder's menu, or "Mute folder" never comes.
+    A mouse lands on the button, and the other tests press the button itself."""
+    token = owui
+    folder = api("/api/v1/folders/", {"name": "Tap " + uuid.uuid4().hex[:4]}, token)["id"]
+    chat, _ = new_chat(token, "stub", "Chat Tap")
+    api(f"/api/v1/chats/{chat}/folder", {"folder_id": folder}, token)
+    ctx = pw.chromium.launch_persistent_context(
+        tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False, args=["--no-sandbox"],
+        viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+    # Signed in as Open WebUI's sign-in leaves a browser: the token in localStorage and in the cookie.
+    # Without the cookie the first /api/config is anonymous (no features), and the sidebar can come
+    # up with no Folders section at all.
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
+    ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(BASE + "/")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.get_by_role("button", name="Open Sidebar").first.click()
+        row = page.locator(f"#folder-{folder}-button")
+        page.wait_for_function(f"""() => document.getElementById('folder-{folder}-button')
+            || [...document.querySelectorAll('button')].some((b) => b.innerText.trim() === 'Folders')""", timeout=WAIT_MS)
+        if not row.count():
+            page.get_by_role("button", name="Folders", exact=True).first.click()
+        row.wait_for(timeout=WAIT_MS)
+        page.evaluate("""() => addEventListener('pointerdown', (e) => { window.ocTapTarget = e.target.closest('a')
+            ? 'link' : e.target.closest('button') ? 'button' : e.target.tagName; }, true)""")
+        # The Folders section slides open (a Svelte transition, a CSS animation): a tap while it runs
+        # lands on the folder's link and the ⋯ never takes the click (measured). Tap once it is done.
+        page.wait_for_function("""(id) => { for (let e = document.getElementById(id); e; e = e.parentElement)
+            if (e.getAnimations().length) return false; return true; }""", arg=f"folder-{folder}-button", timeout=WAIT_MS)
+        row.locator("button[aria-haspopup]").first.tap(force=True)   # where the ⋯ is drawn
+        menu = page.locator("[role=menu]").first
+        menu.wait_for(timeout=WAIT_MS)
+        page.wait_for_function("() => window.ocPushFolderMenuContract === 'ok'", timeout=WAIT_MS)
+        assert menu.evaluate("(m) => m.dataset.ocPush") == "seen"
+        assert menu.evaluate(ITEMS) == ["New Chat", "Create Folder", "Mark all as read", "Mute folder",
+                                        "Edit", "Export", "Delete"]
+    finally:
+        ctx.close()
 
 
 def test_mute_from_open_webuis_own_menus(owui, browser):
@@ -968,7 +1023,7 @@ def test_the_mute_menu_on_top_with_a_gutter_and_the_day(owui, browser):
     page.bring_to_front()
     page.set_viewport_size({"width": 1280, "height": 844})
     g_chat, _ = new_chat(token, "stub", "Chat H")
-    # A long folder name makes the menu's items long (W5's phone menu was flush with the left edge then).
+    # A long folder name makes the menu's items long (on a phone the menu was flush with the left edge then).
     long_folder = api("/api/v1/folders/", {"name": "תיקייה עם שם ארוך מאוד של פרויקט הבית " + uuid.uuid4().hex[:4]}, token)["id"]
     api(f"/api/v1/chats/{g_chat}/folder", {"folder_id": long_folder}, token)
     mm = page.locator("#oc-push-mute-menu")

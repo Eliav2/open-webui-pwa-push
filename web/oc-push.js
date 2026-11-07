@@ -711,7 +711,9 @@
   // - a chat in the sidebar is a box whose child #sidebar-chat-item holds the
   //   chat's link, with its ⋯ (button[aria-haspopup]) further inside the box;
   // - a folder in the sidebar is #folder-<id>-button holding its ⋯; on the
-  //   folder's page (/folders/<id>) the ⋯ is outside the sidebar;
+  //   folder's page (/folders/<id>) the ⋯ is outside the sidebar. A real touch on
+  //   a phone lands on the folder's link (a menu trigger too, aria-haspopup), not
+  //   on the ⋯ button: the same menu opens, so any trigger in the row counts;
   // - the menu is a [role=menu] with .app-dropdown-menu holding
   //   button[role=menuitem] items; a chat's has "Mark as unread", a folder's
   //   "Mark all as read", each known by its icon path.
@@ -738,7 +740,7 @@
   // menu also opens on Enter and Space).
   const OPEN_KEYS = new Set(["Enter", " "]);
   function press(e) {
-    const b = e.target instanceof Element && e.target.closest("button[aria-haspopup]");
+    const b = e.target instanceof Element && e.target.closest("[aria-haspopup]");
     if (!b) return;
     const row = b.closest('[id^="folder-"]');
     const rowId = row && FOLDER_ROW.exec(row.id);
