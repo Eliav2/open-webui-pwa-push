@@ -10,6 +10,7 @@ profile and background networking, so this runs headed under Xvfb. Every wait
 is on state: a service worker decision (`oc-push` message), a notification,
 a saved subscription. None waits on time.
 """
+import base64
 import http.server
 import json
 import os
@@ -107,7 +108,7 @@ def subscriptions(token, page):
 DECISIONS = """(() => { window.ocPushSeen = []; navigator.serviceWorker.addEventListener('message',
   (e) => { if (e.data && e.data.type === 'oc-push') window.ocPushSeen.push(e.data); });
   navigator.serviceWorker.startMessages(); })();"""
-NOTES = "async () => (await (await navigator.serviceWorker.ready).getNotifications()).map(n => ({title: n.title, body: n.body, tag: n.tag, url: n.data && n.data.url}))"
+NOTES = "async () => (await (await navigator.serviceWorker.ready).getNotifications()).map(n => ({title: n.title, body: n.body, tag: n.tag, url: n.data && n.data.url, icon: n.icon, badge: n.badge}))"
 CLEAR = "async () => (await (await navigator.serviceWorker.ready).getNotifications()).forEach(n => n.close())"
 
 
@@ -347,6 +348,13 @@ def valves(token):
     return api("/api/v1/functions/id/web_push/valves/user", token=token)
 
 
+def owui_icon():
+    """Open WebUI's app icon as the service worker shows it: the manifest's first picture, a data: URL."""
+    icon = json.load(urllib.request.urlopen(BASE + "/manifest.json"))["icons"][0]["src"]
+    res = urllib.request.urlopen(BASE + icon)
+    return f"data:{res.headers.get_content_type()};base64," + base64.b64encode(res.read()).decode()
+
+
 def test_preview_reply_mute_and_the_bell(owui, browser):
     ctx, page = browser
     token = owui
@@ -365,6 +373,10 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
         assert d["payload"]["fn"] == "web_push"
         notes = page.evaluate(NOTES)
         assert any(n["tag"] == f"chat-{p_chat}" and n["body"].startswith("STUB-SECRET-REPLY") for n in notes), notes
+        # The picture is Open WebUI's own icon, the badge the browser's.
+        (note,) = [n for n in notes if n["tag"] == f"chat-{p_chat}"]
+        assert note["icon"] == owui_icon(), note["icon"][:80]
+        assert note["badge"] == "", note["badge"]
         page.evaluate(CLEAR)
     finally:
         api("/api/v1/functions/id/web_push/valves/update",

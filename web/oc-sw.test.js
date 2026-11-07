@@ -9,7 +9,7 @@ import vm from "node:vm";
 const SW = process.env.OC_SW || new URL("oc-sw.js", import.meta.url);
 const MAX_LINES = 5;
 
-function worker() {
+function worker({ site = {} } = {}) {
   const listeners = {};
   const shown = new Map();   // tag -> notification
   let clock = 0;             // each notification's timestamp
@@ -42,7 +42,13 @@ function worker() {
     }
     close() {}
   }
-  const fetch = async () => new Response(JSON.stringify({ token: "t" }), { status: 200 });
+  // The server: `site` answers its paths (a function per path), anything else gets a token.
+  const fetched = [];
+  const fetch = async (url) => {
+    const path = new URL(url, "https://chat.example").pathname;
+    fetched.push(path);
+    return site[path] ? site[path]() : new Response(JSON.stringify({ token: "t" }), { status: 200 });
+  };
   const registration = {
     async getNotifications({ tag } = {}) {
       return [...shown.values()].filter((n) => !tag || n.tag === tag);
@@ -60,7 +66,7 @@ function worker() {
     addEventListener: (type, fn) => { listeners[type] = fn; },
   };
   vm.runInNewContext(fs.readFileSync(SW, "utf8"), { self, URL, console, setTimeout, clearTimeout, caches, WebSocket, fetch,
-    Response, AbortSignal, queueMicrotask });
+    Response, AbortSignal, queueMicrotask, btoa });
   async function push(payload) {
     let done;
     listeners.push({ data: { json: () => payload }, waitUntil: (pr) => { done = pr; } });
@@ -74,10 +80,55 @@ function worker() {
   }
   // A swipe: Android removes the notification, then Chrome fires notificationclose.
   const swipe = (n) => { n.close(); return fire("notificationclose", n); };
-  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches };
+  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches, fetched };
 }
 
 const reply = (chat, body, title = "Trip plan") => ({ chat_id: chat, title, body, url: "/c/" + chat });
+
+// An answer from this site as the browser gives it to the worker (same origin: "basic").
+const own = (body, type) => Object.defineProperty(new Response(body, { status: 200, headers: { "content-type": type } }), "type", { value: "basic" });
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 250, 251, 252]);
+const PNG_URL = "data:image/png;base64," + Buffer.from(PNG).toString("base64");
+const SIGN_IN = () => own("<html>Sign in</html>", "text/html");
+const manifest = (icons) => () => own(JSON.stringify({ name: "Open WebUI", icons }), "application/json");
+
+test("the picture is Open WebUI's own app icon, from its manifest, read once; the badge is the browser's", async () => {
+  const w = worker({ site: {
+    "/manifest.json": manifest([{ src: "/static/small.png", sizes: "96x96" },
+      { src: "/static/logo.png", sizes: "500x500", purpose: "any" }, { src: "/static/mask.png", sizes: "1024x1024", purpose: "maskable" }]),
+    "/static/logo.png": () => own(PNG, "image/png"),
+  } });
+  await w.push(reply("a", "one"));
+  await w.push(reply("b", "two"));
+  assert.equal(w.tag("a").icon, PNG_URL);
+  assert.equal(w.tag("b").icon, PNG_URL);
+  assert.equal(w.tag("a").badge, undefined);
+  assert.deepEqual(w.fetched, ["/manifest.json", "/static/logo.png"]);
+});
+
+test("a manifest without icons: Open WebUI's favicon", async () => {
+  const w = worker({ site: { "/manifest.json": manifest([]), "/static/favicon.png": () => own(PNG, "image/png") } });
+  await w.push(reply("a", "one"));
+  assert.equal(w.tag("a").icon, PNG_URL);
+});
+
+test("a sign-in page instead of the icon: no picture, and the next push reads it again", async () => {
+  const site = { "/manifest.json": SIGN_IN, "/static/favicon.png": SIGN_IN };
+  const w = worker({ site });
+  await w.push(reply("a", "one"));
+  assert.equal(w.tag("a").icon, undefined);
+  site["/static/favicon.png"] = () => own(PNG, "image/png");
+  await w.push(reply("a", "two"));
+  assert.equal(w.tag("a").icon, PNG_URL);
+});
+
+test("the function's NOTIFICATION_ICON / NOTIFICATION_BADGE: used as they are, Open WebUI's icon not read", async () => {
+  const w = worker({ site: { "/manifest.json": manifest([{ src: "/static/logo.png" }]), "/static/logo.png": () => own(PNG, "image/png") } });
+  await w.push({ ...reply("a", "one"), icon: "https://cdn.example/team.png", badge: "/static/badge.png" });
+  assert.equal(w.tag("a").icon, "https://cdn.example/team.png");
+  assert.equal(w.tag("a").badge, "/static/badge.png");
+  assert.deepEqual(w.fetched, []);
+});
 
 test("one reply: the chat's title and the preview, as before", async () => {
   const w = worker();

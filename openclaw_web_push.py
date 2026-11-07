@@ -28,6 +28,7 @@ PIPE_SOURCE = "openclaw-pipe"
 # Push services take at most 4096 bytes per message after encryption.
 MAX_PAYLOAD_BYTES = 3000
 MAX_TITLE_CHARS = 120
+MAX_IMAGE_URL_CHARS = 500   # NOTIFICATION_ICON / _BADGE: room left in the push for the rest
 # A push service that never answers: the send is given up. A safety net for a
 # hung connection, never expected to expire.
 PUSH_REQUEST_TIMEOUT_S = 10
@@ -90,8 +91,16 @@ def parse_actions(raw: str) -> list:
     return out
 
 
+def image_url(value: str) -> str:
+    """A NOTIFICATION_ICON / NOTIFICATION_BADGE valve as the push carries it: a path on this
+    site or an https: URL; anything else (a data: URL is too big for a push) is dropped."""
+    value = (value or "").strip()
+    ok = (value.startswith("/") and not value.startswith("//")) or value.startswith("https://")
+    return value[:MAX_IMAGE_URL_CHARS] if ok and len(value) <= MAX_IMAGE_URL_CHARS else ""
+
+
 def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None,
-                  swipe_read: bool = True) -> dict:
+                  swipe_read: bool = True, icon: str = "", badge: str = "") -> dict:
     """What the device gets: the chat's title and where to open it, the id of
     this function (the service worker's Mute writes its user valves), and, only
     with `preview_chars`, the start of the reply. `data.message` holds the whole
@@ -106,6 +115,9 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: li
         payload["fn"] = fn
     if not swipe_read:
         payload["swipe_read"] = False
+    for key, value in (("icon", image_url(icon)), ("badge", image_url(badge))):
+        if value:
+            payload[key] = value
     names = parse_actions(Event.Valves.model_fields["NOTIFICATION_ACTIONS"].default) if actions is None else actions
     names = [a for a in names if fn or a not in NEEDS_FUNCTION_ID]
     if chat_id and names:
@@ -220,6 +232,15 @@ class Event:
             description="The notification's buttons, in order: reply (a text field in the "
                         "notification, sent as your message), read (marks the chat read), mute "
                         "(this chat, 8 hours). Android Chrome shows the first two; iOS shows none.")
+        NOTIFICATION_ICON: str = Field(
+            default="",
+            description="The picture beside the notification's text: a path on this site "
+                        "(/static/...) or an https: URL. Empty: Open WebUI's own app icon.")
+        NOTIFICATION_BADGE: str = Field(
+            default="",
+            description="Android's small icon (status bar): drawn from the picture's transparency "
+                        "only, so a white shape on a transparent background. A path on this site "
+                        "or an https: URL. Empty: the browser's own.")
         PREVIEW_CHARS: int = Field(
             default=0, ge=0, le=2000,
             description="Show the start of the reply (plain text, at most this many characters) "
@@ -276,7 +297,8 @@ class Event:
         subject = await self._subject()
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
-                                            swipe_read=is_on(valves.get("swipe_read"), True)))
+                                            swipe_read=is_on(valves.get("swipe_read"), True),
+                                            icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE))
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject, chat_id)
         if gone:
