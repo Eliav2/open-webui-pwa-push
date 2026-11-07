@@ -1,4 +1,4 @@
-// node --test push/web/oc-sw.test.js: the service worker's push handler, run in a
+// node --test web/oc-sw.test.js: the service worker's push handler, run in a
 // sandbox with a fake registration (Chrome's tag rules: a new notification with a
 // tag replaces the shown one with that tag; close() removes it).
 import test from "node:test";

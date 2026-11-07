@@ -1,4 +1,4 @@
-// oc-push.js: the Web Push page script for Open WebUI (docs/install/web-push.md).
+// oc-push.js: the Web Push page script for Open WebUI (README.md).
 // Serve it as Open WebUI's /static/loader.js (every page loads that file), or
 // append it to yours. Replace the two placeholders when you serve it:
 //   __VAPID_PUBLIC_KEY__  the VAPID public key, base64url (not a secret)
@@ -661,7 +661,7 @@
 
   // --- Items in Open WebUI's own ⋯ menus: a chat's (Mark as read, Mute
   // notifications) and a folder's (Mute folder), in the sidebar and on a folder's page.
-  // The DOM contract with Open WebUI 0.13.0 (push/e2e tests it), found by structure
+  // The DOM contract with Open WebUI 0.13.0 (e2e/ tests it), found by structure
   // and icon, not by text (the menus are translated):
   // - a chat in the sidebar is a box whose child #sidebar-chat-item holds the
   //   chat's link, with its ⋯ (button[aria-haspopup]) further inside the box;

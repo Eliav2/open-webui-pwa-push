@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Web Push E2E stack: a throwaway Open WebUI and the Cloudflare Worker example
 # under `wrangler dev`, in front of it. Usage:
-#   push/e2e/stack.sh up <run_dir> <pipe_build>    # pipe_build: an openclaw_pipe.py with _publish_chat_finished
-#   push/e2e/stack.sh down <run_dir>
-#   push/e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
-#   push/e2e/stack.sh chats <run_dir> 0|1        # its CHAT_CACHE switch (kept chats), the same way
+#   e2e/stack.sh up <run_dir> <pipe_build>    # pipe_build: an openclaw_pipe.py with _publish_chat_finished
+#   e2e/stack.sh down <run_dir>
+#   e2e/stack.sh offline <run_dir> 0|1      # the Worker's OFFLINE switch, Worker restarted
+#   e2e/stack.sh chats <run_dir> 0|1        # its CHAT_CACHE switch (kept chats), the same way
 # Ports: OWUI 18780, Worker 18787, its inspector 18797 (wrangler's default 9229 may be another stack's).
 # E2E_OWUI_PORT / E2E_WORKER_PORT / E2E_INSPECTOR_PORT, with E2E_NAME for the container and unit, give a
 # second stack that can run beside another; the test reads E2E_OWUI and E2E_BASE the same way.
 # Needs docker, bun or npx, uv.
 set -euo pipefail
-here=$(cd "$(dirname "$0")" && pwd); push=$(dirname "$here")
+here=$(cd "$(dirname "$0")" && pwd); root=$(dirname "$here")
 cmd=$1; run=$2
 OWUI_IMAGE=${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.0}
 name=${E2E_NAME:-owui-webpush-e2e}
@@ -64,8 +64,8 @@ docker run -d --name "$name" -p "127.0.0.1:$owui_port:8080" \
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy ] ||
   first_match healthy docker events --since "$since" --filter "container=$name" --filter "event=health_status: healthy"
 # The Worker example, its two scripts and a dev config (no routes: wrangler dev sends every path to it).
-cp "$push/examples/cloudflare-worker/src/index.js" "$run/worker/src/index.js"
-mkdir -p "$run/web"; cp "$push/web/oc-sw.js" "$push/web/oc-push.js" "$run/web/"
+cp "$root/examples/cloudflare-worker/src/index.js" "$run/worker/src/index.js"
+mkdir -p "$run/web"; cp "$root/web/oc-sw.js" "$root/web/oc-push.js" "$run/web/"
 sed -i 's#\.\./\.\./\.\./web/#../web/#' "$run/worker/src/index.js"
 rm -rf "$run/worker/web"; mv "$run/web" "$run/worker/web"   # a second `up` on the same run dir would nest it
 cat > "$run/worker/wrangler.jsonc" <<JSON

@@ -85,7 +85,7 @@ def main(scenario: str) -> None:
         f.write(vapid.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                     serialization.NoEncryption()))
 
-    spec = importlib.util.spec_from_file_location("openclaw_web_push", os.path.join(ROOT, "push", "openclaw_web_push.py"))
+    spec = importlib.util.spec_from_file_location("openclaw_web_push", os.path.join(ROOT, "openclaw_web_push.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     fn = mod.Event()

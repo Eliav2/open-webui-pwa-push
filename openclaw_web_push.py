@@ -6,9 +6,9 @@ version: 0.4.1
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
-# Docs: docs/install/web-push.md. The page script (push/web/oc-push.js) keeps
+# Docs: README.md. The page script (web/oc-push.js) keeps
 # each device's subscription in this function's user valves; the service
-# worker (push/web/oc-sw.js) shows the notification.
+# worker (web/oc-sw.js) shows the notification.
 import asyncio
 import base64
 import hashlib
@@ -33,7 +33,7 @@ MAX_TITLE_CHARS = 120
 PUSH_REQUEST_TIMEOUT_S = 10
 # The push service says the subscription is gone (RFC 8030 section 7.3): drop it.
 GONE_STATUSES = (404, 410)
-# The notification's buttons the service worker knows (push/web/oc-sw.js):
+# The notification's buttons the service worker knows (web/oc-sw.js):
 # reply in the shade, mark the chat read, mute it for 8 hours.
 KNOWN_ACTIONS = ("reply", "read", "mute")
 # Mute writes this function's user valves, so it needs the function's id.

@@ -1,4 +1,4 @@
-// node --test push/web/oc-push-recover.test.js: oc-push.js's reload after a start that
+// node --test web/oc-push-recover.test.js: oc-push.js's reload after a start that
 // a network change broke (ELI-352, ELI-360), run in a sandbox page. The failures
 // come as the events the browser and Vite send; the server answers the probe or not.
 import test from "node:test";

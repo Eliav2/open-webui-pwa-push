@@ -1,4 +1,4 @@
-"""The Web Push function (push/openclaw_web_push.py): title and link only, OpenClaw
+"""The Web Push function (openclaw_web_push.py): title and link only, OpenClaw
 events only from the Pipe, and a real encrypted send (tests/web_push_roundtrip.py)."""
 import importlib.util
 import json
@@ -13,7 +13,7 @@ from unittest import mock
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-spec = importlib.util.spec_from_file_location("openclaw_web_push", os.path.join(ROOT, "push", "openclaw_web_push.py"))
+spec = importlib.util.spec_from_file_location("openclaw_web_push", os.path.join(ROOT, "openclaw_web_push.py"))
 web_push = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(web_push)
 
@@ -356,7 +356,7 @@ class NotificationImageTests(unittest.TestCase):
     def setUp(self):
         import base64
         import re
-        src = open(os.path.join(ROOT, "push", "web", "oc-sw.js")).read()
+        src = open(os.path.join(ROOT, "web", "oc-sw.js")).read()
         self.src = src
         self.urls = {k: v for k, v in re.findall(r'const (BADGE|ICON) = "data:image/png;base64,([^"]+)"', src)}
         self.png = {k: _png_rgba(base64.b64decode(v)) for k, v in self.urls.items()}

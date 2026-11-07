@@ -1,0 +1,7 @@
+# Test and tooling dependencies: uv run --with-requirements requirements-dev.txt pytest -q
+# pydantic and cryptography are the versions Open WebUI 0.13.0 locks: the function runs in its interpreter.
+pydantic==2.13.4
+cryptography==48.0.1
+# The function's own requirement (openclaw_web_push.py frontmatter).
+pywebpush==2.0.3
+pytest==9.2.0

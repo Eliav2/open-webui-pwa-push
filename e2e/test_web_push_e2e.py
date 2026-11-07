@@ -1,9 +1,9 @@
 """Web Push end to end: real Google Chrome, the real push service (FCM), the
 Cloudflare Worker example under `wrangler dev`, a throwaway Open WebUI.
 
-    push/e2e/stack.sh up <run_dir> <openclaw_pipe.py build>
-    E2E_RUN=<run_dir> WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
-    push/e2e/stack.sh down <run_dir>
+    e2e/stack.sh up <run_dir> <openclaw_pipe.py build>
+    E2E_RUN=<run_dir> WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q e2e/test_web_push_e2e.py
+    e2e/stack.sh down <run_dir>
 
 Push needs Google Chrome (Chromium builds have no push service), a persistent
 profile and background networking, so this runs headed under Xvfb. Every wait
@@ -26,13 +26,13 @@ import pytest
 
 # Runs only against a stack this machine started (stack.sh up); the unit job skips it.
 if not os.environ.get("WEB_PUSH_E2E"):
-    pytest.skip("set WEB_PUSH_E2E=1 with push/e2e/stack.sh up", allow_module_level=True)
+    pytest.skip("set WEB_PUSH_E2E=1 with e2e/stack.sh up", allow_module_level=True)
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 OWUI = os.environ.get("E2E_OWUI", "http://127.0.0.1:18780")
 BASE = os.environ.get("E2E_BASE", "http://localhost:18787")   # the Worker
 HERE = os.path.dirname(os.path.abspath(__file__))
-PUSH = os.path.dirname(HERE)
+ROOT = os.path.dirname(HERE)
 CHROME = os.environ.get("E2E_CHROME", "/usr/bin/google-chrome")
 WAIT_MS = 60000  # a safety net for each state wait, never expected to expire
 CHAT_LOAD_DELAY_MS = 200  # chat F arrives just after the reply is in the box (inside Open WebUI's 500 ms draft-save debounce)
@@ -66,7 +66,7 @@ def owui():
     if not cfg["ENABLE_SIGNUP"] or cfg["DEFAULT_USER_ROLE"] != "user":
         api("/api/v1/auths/admin/config", {**cfg, "ENABLE_SIGNUP": True, "DEFAULT_USER_ROLE": "user"}, token)
     have = {f["id"] for f in api("/api/v1/functions/", token=token)}
-    for fid, name, path in (("web_push", "Web Push", os.path.join(PUSH, "openclaw_web_push.py")),
+    for fid, name, path in (("web_push", "Web Push", os.path.join(ROOT, "openclaw_web_push.py")),
                             ("stub", "Stub", os.path.join(HERE, "stub_pipe.py")),
                             ("slow", "Slow", os.path.join(HERE, "slow_pipe.py")),
                             ("openclaw_gateway", "OpenClaw", os.path.join(HERE, "fake_openclaw_pipe.py"))):

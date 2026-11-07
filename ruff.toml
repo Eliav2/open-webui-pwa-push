@@ -1,0 +1,13 @@
+# Correctness lint, not style: each rule names a class of bug with a real failure mode.
+target-version = "py310"
+
+[lint]
+select = [
+    "E9",      # syntax errors
+    "F",       # pyflakes: undefined names, redefinitions, unused imports
+    "PLE",     # pylint errors
+    "RUF006",  # asyncio.create_task without a reference: the loop holds only a weak one
+]
+
+[lint.per-file-ignores]
+"test_*.py" = ["F401", "F811"]

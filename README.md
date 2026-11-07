@@ -8,9 +8,9 @@ Valves: the function's own (below), and the Pipe's [`PUBLISH_CHAT_FINISHED`](../
 
 It has three parts, all in [`push/`](https://github.com/Eliav2/openclaw-openwebui-integration/tree/main/push):
 
-- **The Web Push function** (`push/openclaw_web_push.py`): an Open WebUI event function. On each `chat.finished` it sends a push to each of the user's devices.
-- **The service worker** (`push/web/oc-sw.js`), served at `/oc-sw.js`: it receives the push, shows the notification and runs its Reply and Mute buttons.
-- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", saves each device's subscription, and adds the [mute bell](#mute-a-chat) to a chat. Open WebUI signs in and signs up without loading a page, so the script also runs again on Open WebUI's in-app navigation whenever the signed-in token has changed.
+- **The Web Push function** (`openclaw_web_push.py`): an Open WebUI event function. On each `chat.finished` it sends a push to each of the user's devices.
+- **The service worker** (`web/oc-sw.js`), served at `/oc-sw.js`: it receives the push, shows the notification and runs its Reply and Mute buttons.
+- **The page script** (`web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", saves each device's subscription, and adds the [mute bell](#mute-a-chat) to a chat. Open WebUI signs in and signs up without loading a page, so the script also runs again on Open WebUI's in-app navigation whenever the signed-in token has changed.
 
 Open WebUI loads `/static/loader.js` on every page, but it rebuilds `/static` on every start, so both scripts are served by the proxy in front of Open WebUI: a [Cloudflare Worker](#serve-the-scripts-with-a-cloudflare-worker) or [nginx](#serve-the-scripts-with-nginx). Nothing else in Open WebUI changes.
 
@@ -37,7 +37,7 @@ The private key stays in a file, not in a valve: Open WebUI stores valves unencr
 
 ## 2. Install the function
 
-In **Admin Panel > Functions**, add a function with the content of `push/openclaw_web_push.py`, id `openclaw_web_push`, and turn it on. Open WebUI installs its one requirement, `pywebpush`, on the first load (unless `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS` is off; then install it into the container yourself).
+In **Admin Panel > Functions**, add a function with the content of `openclaw_web_push.py`, id `openclaw_web_push`, and turn it on. Open WebUI installs its one requirement, `pywebpush`, on the first load (unless `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS` is off; then install it into the container yourself).
 
 Its valves:
 
@@ -63,10 +63,10 @@ The page script has two placeholders to replace: `__VAPID_PUBLIC_KEY__` (the pub
 
 ### Serve the scripts with a Cloudflare Worker
 
-`push/examples/cloudflare-worker/` is a Cloudflare Worker for exactly two routes of your Open WebUI hostname: `/oc-sw.js`, which it serves itself, and `/static/loader.js`, which it fetches from Open WebUI and appends the page script to. It never runs on `/api`, `/ws` or `/_app`.
+`examples/cloudflare-worker/` is a Cloudflare Worker for exactly two routes of your Open WebUI hostname: `/oc-sw.js`, which it serves itself, and `/static/loader.js`, which it fetches from Open WebUI and appends the page script to. It never runs on `/api`, `/ws` or `/_app`.
 
 ```bash
-cd push/examples/cloudflare-worker
+cd examples/cloudflare-worker
 cp wrangler.example.jsonc wrangler.jsonc   # your hostname, zone, public key and function id
 npx wrangler deploy
 ```
@@ -77,13 +77,13 @@ Behind Cloudflare Access, add a second Access application with a **Bypass** poli
 
 ### Serve the scripts with nginx
 
-`push/examples/nginx.conf` serves both files from a folder next to nginx, with the placeholders replaced, for example:
+`examples/nginx.conf` serves both files from a folder next to nginx, with the placeholders replaced, for example:
 
 ```bash
 mkdir -p /srv/open-webui-push
-cp push/web/oc-sw.js /srv/open-webui-push/
+cp web/oc-sw.js /srv/open-webui-push/
 sed -e "s/__VAPID_PUBLIC_KEY__/<public key>/g" -e "s/__FUNCTION_ID__/openclaw_web_push/g" \
-  push/web/oc-push.js > /srv/open-webui-push/oc-push.js
+  web/oc-push.js > /srv/open-webui-push/oc-push.js
 ```
 
 The page script replaces Open WebUI's `loader.js`, which is empty unless you put something in it. If you did, append it to `oc-push.js`.
@@ -101,7 +101,7 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 - **One notification per chat, stacked.** A newer reply in the same chat joins the notification that is still showing (its tag is `chat-<chat id>`), as in a messaging app: the title counts the replies (`Trip plan · 3 new messages`) and, with previews on, the body keeps the latest 5 previews, one line each, newest last. Each new reply sounds once. Opening the chat, Mark as read or swiping the notification away (which also [marks the chat read](#swipe-to-read)) closes it, and the next reply starts again from one. Two chats with the same title are two notifications.
 - **Not while you use it.** While Open WebUI is open, visible and focused on a device, whatever chat is open, that device shows nothing, as in a messaging app; Open WebUI's own sidebar shows the new reply. In the background, closed or with the screen off, it notifies. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
 - **Title, and the reply only with the preview.** The push carries the chat's title, its id, the link and the function's id. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function forwards only the [preview](#preview), and only when it is on.
-- **A crab claw in the status bar.** Android draws a notification's small icon (the `badge`) from its transparency only, so the service worker sends a white claw on a transparent background; the picture beside the text is the same claw in colour. Both are inside `oc-sw.js` (drawn from `push/web/icons/*.svg` by `make_icons.py`), so they need no file of their own in `/static` and no Access bypass.
+- **A crab claw in the status bar.** Android draws a notification's small icon (the `badge`) from its transparency only, so the service worker sends a white claw on a transparent background; the picture beside the text is the same claw in colour. Both are inside `oc-sw.js` (drawn from `web/icons/*.svg` by `make_icons.py`), so they need no file of their own in `/static` and no Access bypass.
 - **Opened means read.** When a chat is on screen on a device, opened in any way (the notification, the sidebar, a link, the app coming back to the front on it), that device closes the chat's notification. Other devices keep theirs until the chat is opened there.
 - **Tap to open.** A tap on the notification focuses an open Open WebUI window and opens the chat inside it, as a click in the sidebar does (no page reload; already on that chat, nothing changes), or opens a new window when none is open. A page with an older page script does not answer the service worker; after 3 seconds that window loads the chat instead. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
 - **Buttons.** Reply and Mute 8 h by default, or Mark as read; see [Buttons](#buttons).
@@ -222,12 +222,12 @@ Each part is separate:
 
 ## Tests
 
-`tests/test_web_push_unit.py` covers the payload (never the reply), which events are sent, and a real encrypted send to a local push service. `push/e2e/` drives Google Chrome against the real push service (FCM), the Cloudflare Worker example under `wrangler dev` and a throwaway Open WebUI:
+`tests/test_web_push_unit.py` covers the payload (never the reply), which events are sent, and a real encrypted send to a local push service. `e2e/` drives Google Chrome against the real push service (FCM), the Cloudflare Worker example under `wrangler dev` and a throwaway Open WebUI:
 
 ```bash
-push/e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py
-E2E_RUN=/tmp/web-push-e2e WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
-push/e2e/stack.sh down /tmp/web-push-e2e
+e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py
+E2E_RUN=/tmp/web-push-e2e WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q e2e/test_web_push_e2e.py
+e2e/stack.sh down /tmp/web-push-e2e
 ```
 
 It needs Google Chrome (Chromium has no push service), Docker, `bunx` and outbound internet.

@@ -1,0 +1,15 @@
+{
+ "examples/cloudflare-worker/src/index.js": {
+  "no-restricted-syntax": {
+   "count": 2
+  }
+ },
+ "web/oc-push.js": {
+  "no-magic-numbers": {
+   "count": 6
+  },
+  "no-restricted-syntax": {
+   "count": 7
+  }
+ }
+}

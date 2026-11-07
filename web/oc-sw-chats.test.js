@@ -1,4 +1,4 @@
-// node --test push/web/oc-sw-chats.test.js: kept chats (oc-sw.js), run in a sandbox
+// node --test web/oc-sw-chats.test.js: kept chats (oc-sw.js), run in a sandbox
 // with a fake Cache Storage and a network each test answers by hand. The worker is
 // served as the proxy serves it, with its switches set (OFFLINE, CHAT_CACHE).
 import test from "node:test";
