@@ -11,6 +11,7 @@ is on state: a service worker decision (`oc-push` message), a notification,
 a saved subscription. None waits on time.
 """
 import base64
+import collections
 import hashlib
 import http.server
 import json
@@ -194,7 +195,45 @@ def settled(page, check, arg=None):
         if page.evaluate(check, arg):
             return
         time.sleep(STATE_POLL_S)
+    print(sw_diagnostics(page))
     raise AssertionError("never settled: " + check[:120])
+
+
+def controlled(page):
+    """Waits until the service worker controls the page (its first load ran before it did)."""
+    try:
+        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    except Exception:
+        print(sw_diagnostics(page))
+        raise
+
+
+SW_STATE = """async () => { const r = await navigator.serviceWorker.getRegistration('/');
+  const w = (x) => x && {state: x.state, url: x.scriptURL};
+  return JSON.stringify({controller: w(navigator.serviceWorker.controller), active: w(r?.active),
+    waiting: w(r?.waiting), installing: w(r?.installing), caches: await caches.keys(),
+    registrations: (await navigator.serviceWorker.getRegistrations()).length,
+    ocPushState: window.ocPushState ?? null, visible: document.visibilityState, url: location.href}); }"""
+
+
+def sw_diagnostics(page):
+    """A service worker that never settled (or a page it never updated): the page's view of its
+    registration and caches, and Chrome's (each version's status, its clients, running or not)."""
+    out = ["--- service worker diagnostics"]
+    try:
+        out.append("page: " + page.evaluate(SW_STATE))
+    except Exception as e:
+        out.append(f"page: {e}")
+    tab = page.context.new_page()
+    try:
+        tab.goto("chrome://serviceworker-internals")
+        tab.wait_for_function("() => document.body.innerText.length > 0", timeout=WAIT_MS)
+        out.append(tab.evaluate("() => document.body.innerText")[:DIAG_CHARS])
+    except Exception as e:
+        out.append(f"serviceworker-internals: {e}")
+    finally:
+        tab.close()
+    return "\n".join(out)
 
 
 def ready(page):
@@ -237,12 +276,69 @@ def pw():
         yield p
 
 
+TRACE_MAX = 300   # the page events a failed test reports (the last ones)
+TRACE = collections.deque(maxlen=TRACE_MAX)
+PENDING = {}      # the page's requests with no answer yet -> their url
+TRACED = []       # the pages traced (the module's browser page stays across tests)
+
+
+def trace(page):
+    """A page's loads, failed requests and errors, for the report of a test that fails."""
+    def note(kind, detail):
+        TRACE.append(f"{time.time():.3f} {kind} {detail}")
+    def navigated(frame):
+        if frame == page.main_frame:
+            note("nav", frame.url)
+    def failed(r):
+        PENDING.pop(r, None)
+        note("failed", f"{r.method} {r.url} {r.failure}")
+    def console(m):
+        if m.type in ("error", "warning"):
+            note("console." + m.type, m.text[:TRACE_TEXT])
+    TRACED.append(page)
+    page.on("framenavigated", navigated)
+    page.on("domcontentloaded", lambda p: note("domcontentloaded", p.url))
+    page.on("load", lambda p: note("load", p.url))
+    page.on("request", lambda r: PENDING.__setitem__(r, f"{r.method} {r.url}"))
+    page.on("requestfinished", lambda r: PENDING.pop(r, None))
+    page.on("requestfailed", failed)
+    page.on("console", console)
+    page.on("pageerror", lambda e: note("pageerror", str(e)[:TRACE_TEXT]))
+
+
+TRACE_TEXT = 300   # characters kept of a message
+
+
+@pytest.fixture(autouse=True)
+def page_trace(request):
+    """On a failure: what the pages did last, what they still wait for, and their service worker."""
+    TRACE.clear()
+    PENDING.clear()
+    TRACED[:] = [p for p in TRACED if not p.is_closed()]
+    yield
+    rep = getattr(request.node, "rep_call", None)
+    if rep is None or not rep.failed:
+        return
+    print("--- page trace (last events)")
+    print("\n".join(TRACE))
+    print("--- requests still without an answer")
+    print("\n".join(PENDING.values()) or "(none)")
+    for page in list(TRACED):   # (the diagnostics' own tab joins the list)
+        if not page.is_closed():
+            print(sw_diagnostics(page))
+
+
 def chrome(pw):
     """Google Chrome with its own new profile, as a phone-sized window."""
-    return pw.chromium.launch_persistent_context(
+    ctx = pw.chromium.launch_persistent_context(
         tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
+    ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
+    for page in ctx.pages:
+        trace(page)
+    ctx.on("page", trace)
+    return ctx
 
 
 @pytest.fixture(scope="module")
@@ -794,7 +890,7 @@ def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
         ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(BASE + "/")
-        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        controlled(page)
         page.evaluate("""([c, text]) => caches.open('oc-push-drafts').then((d) =>
             d.put('/oc-push/draft/' + c, new Response(JSON.stringify({text, at: Date.now()}))))""", [chat, "only once"])
         page.goto(f"{BASE}/c/{chat}?oc-reply=unsent")
@@ -975,6 +1071,8 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
         menu.wait_for(timeout=WAIT_MS)
         page.wait_for_function("() => window.ocPushFolderMenuContract === 'ok'", timeout=WAIT_MS)
         assert menu.evaluate("(m) => m.dataset.ocPush") == "seen"
+        # The contract is known at once; the items come once the user's folders are read (a request).
+        menu.locator("[data-oc-push-item=mute]").wait_for(timeout=WAIT_MS)
         assert menu.evaluate(ITEMS) == ["New Chat", "Create Folder", "Mark all as read", "Mute folder",
                                         "Edit", "Export", "Delete"]
     finally:
@@ -1177,7 +1275,7 @@ OFFLINE_CACHES = "() => caches.keys()"
 def warm(page, chat):
     """The chat opened online under the service worker, so its reads and files are kept."""
     page.goto(f"{BASE}/c/{chat}")
-    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    controlled(page)
     page.reload()   # the first load ran before the worker controlled the page
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
     settled(page, """(c) => caches.keys().then(async (ks) => {
@@ -1284,7 +1382,7 @@ needs_chats = pytest.mark.skipif("not chats_on()", reason="kept chats are off on
 def opened(page, chat):
     """The chat opened under the service worker (both modes)."""
     page.goto(f"{BASE}/c/{chat}")
-    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    controlled(page)
     page.reload()
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
 
@@ -1400,12 +1498,13 @@ def test_start_reads_cut_by_a_network_change_still_open_the_chat(owui, pw):
 # page script and Open WebUI each wrap window.fetch: whoever reads it gets the top wrapper at that
 # time, and a call counts only when it goes to the top one, not from one wrapper to the next.
 OUTER_FETCH = """(path) => {
-    const seen = window.__ocOuter = {calls: 0, ends: 0};
+    const seen = window.__ocOuter = {calls: 0, ends: 0, sent: 0};
     const layers = [window.fetch];
     const view = (k) => function (input, init) {
         const p = layers[k].call(this, input, init);
-        if (k !== layers.length - 1) return p;
         if (new URL(input instanceof Request ? input.url : String(input), location.href).pathname !== path) return p;
+        if (k === 0) seen.sent++;   // the browser's own fetch: a request the page sends
+        if (k !== layers.length - 1) return p;
         seen.calls++;
         return p.finally(() => { seen.ends++; });
     };
@@ -1427,7 +1526,7 @@ def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui,
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{BASE}/c/{chat}")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        controlled(page)
         page.reload()   # a load the worker answers: the app is kept
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
@@ -1445,8 +1544,12 @@ def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui,
             # Every call Open WebUI made has its answer (it may ask the list more than once).
             page.wait_for_function("() => window.__ocOuter.ends >= 1 && window.__ocOuter.ends === window.__ocOuter.calls",
                                    timeout=WAIT_MS)
-            calls = page.evaluate("() => window.__ocOuter.calls")
-            assert attempts == [True] * (CUT_ATTEMPTS * calls), (calls, attempts)
+            calls, sent = page.evaluate("() => [window.__ocOuter.calls, window.__ocOuter.sent]")
+            # One request per call (the page asked none again), each one asked twice by the worker
+            # alone. Calls on their way together share one request (oc-sw.js shared()).
+            assert sent == calls, (calls, sent)
+            assert attempts and all(attempts), attempts
+            assert len(attempts) % CUT_ATTEMPTS == 0 and len(attempts) <= CUT_ATTEMPTS * calls, (calls, attempts)
         finally:
             ctx.unroute("**" + PINNED_PATH, cut_always)
     finally:
@@ -1656,7 +1759,11 @@ def test_the_kept_app_runs_while_the_version_check_gets_no_answer(owui, browser)
     chat, _ = new_chat(owui, "stub", "Chat Silent")
     warm(page, chat)
     silent = threading.Event()
-    srv = slow_server(lambda path: (b"{}", "application/json"), gate=silent)
+    # Let go at the end with the server's own version, as the kept app's: any other answer is a
+    # new Open WebUI to the worker, which drops every cache and reloads the page into the next test.
+    with urllib.request.urlopen(BASE + "/api/version", timeout=30) as r:
+        same = r.read()
+    srv = slow_server(lambda path: (same, "application/json"), gate=silent)
     def no_answer(route):
         if route.request.service_worker is None:
             return route.fallback()
@@ -1869,7 +1976,12 @@ def kept_then_fresh(page, gate, old, new):
     page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
     assert page.get_by_text(new).count() == 0
     gate.set()
-    page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
+    try:
+        page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
+    except Exception:
+        print(sw_diagnostics(page), "\nupdating pill:", page.locator(UPDATING_PILL).count(),
+              "| old shown:", page.get_by_text(old).count())
+        raise
     page.locator(UPDATING_PILL).wait_for(state="detached", timeout=WAIT_MS)
     page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
 
