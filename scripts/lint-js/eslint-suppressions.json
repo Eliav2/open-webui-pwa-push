@@ -6,7 +6,7 @@
  },
  "web/oc-push.js": {
   "no-magic-numbers": {
-   "count": 6
+   "count": 5
   },
   "no-restricted-syntax": {
    "count": 7

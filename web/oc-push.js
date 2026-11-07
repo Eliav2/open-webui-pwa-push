@@ -130,7 +130,9 @@
   }
 
   // A short line at the top of the page (a reply that was not sent, a failed mute).
-  function notice(text) {
+  // One that must be read (nothing can be sent) stays until it is tapped.
+  const NOTICE_MS = 8000;
+  function notice(text, { stay = false } = {}) {
     document.getElementById("oc-push-notice")?.remove();
     const n = document.createElement("div");
     n.id = "oc-push-notice";
@@ -140,7 +142,7 @@
     n.textContent = text;
     n.onclick = () => n.remove();
     document.body.appendChild(n);
-    setTimeout(() => n.remove(), 8000);
+    if (!stay) setTimeout(() => n.remove(), NOTICE_MS);
   }
 
   const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
@@ -331,12 +333,15 @@
 
   // Open WebUI navigates a few times while it starts (each runs chatPage): they
   // share the one read on its way instead of each asking the server.
-  let loadingMutes = null;
+  let loadingMutes = null, problemShown = "";
   function loadMutes() {
     return loadingMutes ||= valves("").then((v) => {
       v ||= {};
       mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
       hasDevices = parse(v.subscriptions, "[]").length > 0;
+      // The function could not send this user's notifications (openclaw_web_push.py
+      // push_problem, e.g. no usable VAPID subject): say why, once per page.
+      if (v.push_problem && hasDevices && v.push_problem !== problemShown) notice(problemShown = v.push_problem, { stay: true });
     }).finally(() => { loadingMutes = null; });
   }
 

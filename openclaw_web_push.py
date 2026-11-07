@@ -2,7 +2,7 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.4.1
+version: 0.5.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
@@ -18,7 +18,9 @@ import os
 import re
 import time
 
-from pydantic import BaseModel, Field
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, Field, field_validator
 
 log = logging.getLogger("openclaw_web_push")
 
@@ -29,6 +31,17 @@ PIPE_SOURCE = "openclaw-pipe"
 MAX_PAYLOAD_BYTES = 3000
 MAX_TITLE_CHARS = 120
 MAX_IMAGE_URL_CHARS = 500   # NOTIFICATION_ICON / _BADGE: room left in the push for the rest
+# The VAPID subject push services take (RFC 8292 section 2.1); py_vapid drops any other,
+# and every send then fails with "Missing 'sub' from claims".
+SUBJECT_SCHEMES = ("mailto:", "https://")
+# Apple's push service (web.push.apple.com) refuses the whole token, 403 BadJwtToken, when the
+# subject names no public host: localhost, *.localhost, *.local or a bare name. FCM takes them.
+LOCAL_HOST = "localhost"
+LOCAL_HOST_SUFFIXES = (".localhost", ".local")
+LABEL_DOT = "."   # a bare name (no dot) is no public host
+# Written into the user's own valves (push_problem) when nothing can be sent; the page shows it.
+NO_SUBJECT = ("Notifications can't be sent yet: the admin must set VAPID_SUBJECT in the Web Push "
+              "function's valves (a mailto: address or an https: URL on a public host), since WEBUI_URL is not one.")
 # A push service that never answers: the send is given up. A safety net for a
 # hung connection, never expected to expire.
 PUSH_REQUEST_TIMEOUT_S = 10
@@ -185,6 +198,17 @@ def topic_for(chat_id: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(chat_id.encode()).digest()[:24]).decode().rstrip("=")
 
 
+def subject_problem(v: str) -> str:
+    """Why `v` can't be the VAPID subject; "" when it can."""
+    if not v.startswith(SUBJECT_SCHEMES):
+        return "must be a mailto: address or an https: URL"
+    host = v.split("?")[0].split("@")[-1] if v.startswith("mailto:") else (urlsplit(v).hostname or "")
+    host = host.lower().rstrip(LABEL_DOT)
+    if host == LOCAL_HOST or host.endswith(LOCAL_HOST_SUFFIXES) or LABEL_DOT not in host:
+        return "must name a public host (Apple refuses localhost, .local and bare names)"
+    return ""
+
+
 def parse_subscriptions(raw) -> list:
     try:
         subs = json.loads(raw or "[]") if isinstance(raw, str) else (raw or [])
@@ -214,8 +238,8 @@ class Event:
                         "Kept in a file because valves are stored unencrypted by default.")
         VAPID_SUBJECT: str = Field(
             default="",
-            description="Contact the push services may use (mailto: or https: URL). Empty: "
-                        "Open WebUI's WEBUI_URL.")
+            description="Contact the push services may use: a mailto: address or an https: URL. Empty: "
+                        "Open WebUI's WEBUI_URL, which must then be https (otherwise nothing is sent).")
         TTL_SECONDS: int = Field(
             default=3600, ge=0,
             description="How long a push service keeps a notification for a device that is offline.")
@@ -247,6 +271,15 @@ class Event:
                         "in the notification. 0: off, the body says 'New reply'. The text shows on "
                         "the lock screen and in the notification shade of every subscribed device.")
 
+        @field_validator("VAPID_SUBJECT")
+        @classmethod
+        def _usable_subject(cls, v: str) -> str:
+            """Refused when the admin saves it (Open WebUI shows the error): push services take only these."""
+            v = (v or "").strip()
+            if v and (problem := subject_problem(v)):
+                raise ValueError(f"VAPID_SUBJECT {problem} (for example mailto:admin@example.com), not {v!r}")
+            return v
+
     class UserValves(BaseModel):
         subscriptions: str = Field(
             default="[]",
@@ -263,9 +296,14 @@ class Event:
             default=True,
             description="A notification swiped away marks its chat read (Android Chrome; "
                         "'Clear all' marks every chat in it read). Off: a swipe only hides it.")
+        push_problem: str = Field(
+            default="",
+            description="Written by the function: why it cannot send your notifications (empty: it "
+                        "can). The page shows it. Not set by hand.")
 
     def __init__(self):
         self.valves = self.Valves()
+        self._subject_logged = False   # the missing subject's error, once per load of the function
 
     async def event(self, event: dict, __id__: str = "", **kwargs):
         prefixes = [p.strip() for p in self.valves.PIPE_MODEL_PREFIXES.split(",") if p.strip()]
@@ -295,6 +333,13 @@ class Event:
         if key is None:
             return
         subject = await self._subject()
+        # Said where the user sees it (the page shows push_problem), and cleared once it can send.
+        problem = "" if subject else NO_SUBJECT
+        if (valves.get("push_problem") or "") != problem:
+            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {**valves, "push_problem": problem})
+        if not subject:
+            log.info("web push: no VAPID subject, nothing sent chat_id=%s", chat_id)
+            return
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
                                             swipe_read=is_on(valves.get("swipe_read"), True),
@@ -329,6 +374,8 @@ class Event:
             return None
 
     async def _subject(self) -> str:
+        """VAPID_SUBJECT (the valve refuses any other), else Open WebUI's WEBUI_URL when it is an https URL
+        on a public host. Neither: "", and nothing can be sent."""
         if self.valves.VAPID_SUBJECT:
             return self.valves.VAPID_SUBJECT
         try:
@@ -336,7 +383,15 @@ class Event:
             url = (await Config.get("webui.url") or "").rstrip("/")
         except Exception:
             url = ""
-        return url or "mailto:webmaster@localhost"
+        problem = subject_problem(url)
+        if not problem:
+            return url
+        if not self._subject_logged:
+            self._subject_logged = True
+            log.error("web push: nothing can be sent: VAPID_SUBJECT is empty and WEBUI_URL %r %s. "
+                      "Set VAPID_SUBJECT (a mailto: address or an https: URL on a public host) in the "
+                      "function's valves.", url, problem)
+        return ""
 
     def send_all(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str) -> set:
         """Send `body` to each subscription; returns the endpoints the push

@@ -233,6 +233,50 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
         self.assertTrue(web_push.Event.UserValves().swipe_read)
 
+    def webui_url(self, url):
+        """Open WebUI's saved WEBUI_URL as the function reads it."""
+        class Config:
+            @staticmethod
+            async def get(key):
+                return url if key == "webui.url" else None
+        mods = {"open_webui.models.config": types.ModuleType("open_webui.models.config")}
+        mods["open_webui.models.config"].Config = Config
+        p = mock.patch.dict(sys.modules, mods)
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def test_no_subject_and_a_plain_http_webui_url_sends_nothing_and_says_why(self):
+        """W7's G1: an http WEBUI_URL is no subject. Nothing is sent (it would fail at the push service),
+        the user's push_problem says why (the page shows it) and the log says so once, as an error."""
+        self.fn.valves.VAPID_SUBJECT = ""
+        self.webui_url("http://localhost:3000")
+        with self.assertLogs("openclaw_web_push", "ERROR") as logs:
+            await self.fn.event(finished(), __id__="web_push")
+            await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.store["push_problem"], web_push.NO_SUBJECT)
+        self.assertIn("VAPID_SUBJECT", web_push.NO_SUBJECT)
+        errors = [r for r in logs.records if r.levelname == "ERROR"]
+        self.assertEqual(len(errors), 1, [r.getMessage() for r in errors])
+        self.assertIn("http://localhost:3000", errors[0].getMessage())
+
+    async def test_an_https_webui_url_on_localhost_is_no_subject(self):
+        self.fn.valves.VAPID_SUBJECT = ""
+        self.webui_url("https://localhost:8443")
+        with self.assertLogs("openclaw_web_push", "ERROR"):
+            await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.store["push_problem"], web_push.NO_SUBJECT)
+
+    async def test_an_https_webui_url_is_the_subject_and_clears_the_problem(self):
+        self.fn.valves.VAPID_SUBJECT = ""
+        self.webui_url("https://chat.example/")
+        self.store["push_problem"] = web_push.NO_SUBJECT
+        await self.fn.event(finished(), __id__="web_push")
+        (_subs, _body, _key, subject), = self.sent
+        self.assertEqual(subject, "https://chat.example")
+        self.assertEqual(self.store["push_problem"], "")
+
     async def test_no_send_without_the_key_file(self):
         self.fn.valves.VAPID_PRIVATE_KEY_FILE = "/nonexistent/vapid.pem"
         with self.assertLogs("openclaw_web_push", "ERROR"):
@@ -349,6 +393,25 @@ class NotificationImageTests(unittest.TestCase):
         src = open(os.path.join(ROOT, "web", "oc-sw.js")).read()
         self.assertNotIn("data:image/", src)
         self.assertIn("icon: p.icon || await ownIcon(),", src)
+
+
+class SubjectValveTests(unittest.TestCase):
+    """VAPID_SUBJECT: push services take only a mailto: or https: subject (py_vapid drops any other and every
+    send fails). Anything else is refused when the admin saves the valves; Open WebUI shows the error."""
+
+    def test_a_mailto_or_https_subject_or_none(self):
+        for ok in ("mailto:admin@example.com", "https://chat.example", "", "  mailto:a@b.example  "):
+            self.assertEqual(web_push.Event.Valves(VAPID_SUBJECT=ok).VAPID_SUBJECT, ok.strip())
+
+    def test_anything_else_is_refused_with_why(self):
+        for bad in ("admin@example.com", "http://localhost:3000", "chat.example.com",
+                    # Apple: 403 BadJwtToken for a subject on no public host
+                    "mailto:webmaster@localhost", "mailto:a@box.local", "https://localhost:3000",
+                    "https://app.localhost", "https://chat"):
+            with self.assertRaises(Exception) as ctx:
+                web_push.Event.Valves(VAPID_SUBJECT=bad)
+            self.assertIn("mailto:", str(ctx.exception))
+            self.assertIn("VAPID_SUBJECT", str(ctx.exception))
 
 
 class LogIdsTests(unittest.TestCase):
