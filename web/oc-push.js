@@ -548,6 +548,17 @@
     if (!id || !mode) return;
     q.delete(REPLY_PARAM);
     history.replaceState(history.state, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
+    // From here until the reply is in the box, a reload for the chat's fresh copy (CHAT_FRESH)
+    // takes it along: it can come before Open WebUI has drawn the box. The run that set it clears it.
+    const mine = !replyWaiting.has(id);
+    if (mine) replyWaiting.set(id, mode);
+    try {
+      await putReply(id, mode);
+    } finally {
+      if (mine) replyWaiting.delete(id);
+    }
+  }
+  async function putReply(id, mode) {
     let text = "", drafts = null, draft = null;
     const key = "/oc-push/draft/" + id;
     try {
@@ -569,9 +580,7 @@
       setTimeout(() => { o.disconnect(); ok(find()); }, 15000);
     });
     // A locked box (offline, or the chat still its kept copy) takes no text: wait.
-    replyWaiting.set(id, mode);
     if (box) await writable();
-    replyWaiting.delete(id);
     // Still this chat's box (the page may have gone to another chat meanwhile).
     const now = chatIdNow() === id ? document.querySelector("#chat-input") : null;
     let put = false;
