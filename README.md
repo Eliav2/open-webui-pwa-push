@@ -81,7 +81,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out <data volume>/web-push/vapi
 openssl ec -in <data volume>/web-push/vapid_private.pem -pubout -outform DER | tail -c 65 | base64 | tr '/+' '_-' | tr -d '=\n'
 ```
 
-The last command prints the public key (87 characters). It is not a secret: the page script gets it. Keep a backup of the private key; a new one makes every device subscribe again. The private key stays in a file, not in a valve: Open WebUI stores valves unencrypted unless `ENABLE_VALVE_ENCRYPTION` is on.
+The private key file must be readable by the user Open WebUI runs as inside its container: the official image runs as root, so `openssl`'s owner-only file works there; with another user, `chown` the file to it. The last command prints the public key (87 characters). It is not a secret: the page script gets it. Keep a backup of the private key; a new one makes every device subscribe again. The private key stays in a file, not in a valve: Open WebUI stores valves unencrypted unless `ENABLE_VALVE_ENCRYPTION` is on.
 
 #### 2. Install the function
 
@@ -120,6 +120,16 @@ npx wrangler deploy
 
 The API token needs Workers Scripts: Edit (account) and Workers Routes: Edit (zone).
 
+To try it first without a Cloudflare zone, run it locally in front of Open WebUI (here on port 3000) and open `http://localhost:8788`:
+
+```bash
+cd examples/cloudflare-worker
+cp wrangler.example.jsonc wrangler.jsonc   # the vars above; the routes do not matter locally
+npx wrangler dev --port 8788 --local-upstream localhost:3000
+```
+
+Locally every path reaches the Worker, which passes all but its two to Open WebUI. `localhost` is a secure context, so the service worker and push work there; another host needs https. [`e2e/stack.sh`](./e2e/stack.sh) does the same with a throwaway Open WebUI.
+
 Or with Cloudflare's button, which copies this repo into your GitHub account and deploys the Worker from it (the repo's [`wrangler.jsonc`](./wrangler.jsonc): offline open and instant chat open on, push off):
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Eliav2/open-webui-pwa-push)
@@ -130,7 +140,7 @@ Then, in the Worker's **Settings > Domains & Routes**, add the two routes `<your
 
 ### Serve the scripts with nginx
 
-[`examples/nginx.conf`](./examples/nginx.conf) serves both files from a folder next to nginx, with the placeholders replaced, for example:
+[`examples/nginx.conf`](./examples/nginx.conf) is a complete `server` block: Open WebUI proxied (with the WebSocket upgrade and buffering off, which its streaming needs), and the two files served from a folder next to nginx. nginx picks the two exact `location =` matches over `location /` wherever they are in the block. Put the files there with the placeholders replaced, for example:
 
 ```bash
 mkdir -p /srv/open-webui-push
@@ -144,6 +154,8 @@ Leave out the second `sed` (copy `oc-push.js` as it is) for the minimal install,
 ### The first load after you switch
 
 Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded Open WebUI before you started serving the page script keeps the old, empty file until that runs out: nothing of this runs on it before then. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch, and every later change reaches a device on its next page load. To avoid the wait, serve the page script a day ahead with push off; on Cloudflare a Cache Rule for `/static/loader.js` with Browser TTL "Respect origin" does the same. On one device, clearing the browser's cached files (not its cookies or site data) skips it.
+
+On a device that already has the service worker with offline open on (for example, you go from the minimal install to the full one), the service worker keeps `/static/loader.js` like the rest of the app: it answers from its kept copy at once and fetches the new one for next time. So a changed page script shows from the **second** page load on that device; the Enable notifications offer appears then.
 
 ### OpenClaw models
 
@@ -171,6 +183,7 @@ A notification when a reply finishes, on each of your devices, with the chat's t
 - **Your Open WebUI's icon.** The picture beside the text is your instance's own app icon, so a custom-branded Open WebUI shows its own. The service worker reads it once (the first picture in `/manifest.json`, else `/static/favicon.png`) and keeps it on the device; a new version of the service worker reads it again. Android's small status-bar icon is the browser's own: Android draws it from the picture's transparency only, and an app icon would be a blank square there. The admin valves [`NOTIFICATION_ICON` and `NOTIFICATION_BADGE`](#settings) set others.
 
 <p align="center"><img src="./docs/img/android-notification.png" alt="An Android notification: Trip ideas, a preview of the reply, Reply and Mark as read" width="420"></p>
+<p align="center"><sub>With <code>PREVIEW_CHARS</code> on and <code>NOTIFICATION_ACTIONS=reply,read</code>. With the defaults the body says "New reply" and the buttons are Reply and Mute 8 h (Chrome adds its own Unsubscribe).</sub></p>
 
 ### Reply from the notification
 
@@ -198,7 +211,7 @@ In a chat, a bell in Open WebUI's header shows whether the chat notifies. Click 
 
 <p align="center">
   <img src="./docs/img/bell.png" alt="The bell's menu in a chat: notifications on, Mute for 1 hour, for 8 hours, always" width="220">
-  <img src="./docs/img/muted.png" alt="A muted chat: the bell crossed out, its menu says Muted until 03:07 PM, with Unmute" width="220">
+  <img src="./docs/img/muted.png" alt="A muted chat: the bell crossed out, its menu says until when it is muted, with Unmute" width="220">
 </p>
 
 ### Mute a folder
@@ -212,7 +225,7 @@ In a chat that is in a folder, the bell's menu has a second part for the folder:
 
 ### Offline open
 
-With `OFFLINE` on, the service worker keeps Open WebUI itself and the chats you read last on the device, so the app opens on a slow network, or with none. With no network a pill says "Offline: saved chats, read-only" and the message box is locked, so nothing is typed that cannot be sent; text already in the box stays and can be sent once the network is back. A network that answers nothing at all is given up on after 4.2 s, then the kept copy is used. [Details](#offline-open-request-by-request).
+With `OFFLINE` on, the service worker keeps Open WebUI itself and the chats you read last on the device, so the app opens on a slow network, or with none. With no network a pill says "Offline: saved chats, read-only" and the message box is locked, so nothing is typed that cannot be sent; text already in the box stays and can be sent once the network is back. The pill needs the device itself to be offline (the browser's `navigator.onLine`). With the device online and your server unreachable (the server, proxy or tunnel down), a kept chat opens the same way but with the "Updating…" pill of [instant chat open](#instant-chat-open), and its box stays locked until the server answers. A network that answers nothing at all is given up on after 4.2 s, then the kept copy is used. [Details](#offline-open-request-by-request).
 
 <p align="center"><img src="./docs/img/offline.png" alt="A chat on a phone with no network: Offline: saved chats, read-only, the message box greyed out" width="220"></p>
 
