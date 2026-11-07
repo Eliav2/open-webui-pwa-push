@@ -367,6 +367,7 @@ def chrome(pw):
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
     ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
+    ctx.add_init_script(PAGE_READS)
     for page in ctx.pages:
         trace(page)
     ctx.on("page", trace)
@@ -2159,9 +2160,18 @@ def worker_offline(value):
 INFLIGHT_WAIT_MS = 3000   # a worker that answers at all does so at once
 INFLIGHT_ASK = """(ms) => new Promise((done) => {
     navigator.serviceWorker.addEventListener('message', (e) => {
-        if (e.data && e.data.type === 'oc-debug-inflight') done(e.data.list); });
-    navigator.serviceWorker.controller.postMessage({type: 'oc-debug-inflight'});
-    setTimeout(() => done('no answer (a worker without the probe)'), ms); })"""
+        if (e.data && e.data.type === 'oc-e2e-inflight') done(e.data.list); });
+    navigator.serviceWorker.controller.postMessage({type: 'oc-e2e-inflight'});
+    setTimeout(() => done('no answer (a worker without e2e/sw_inflight.js)'), ms); })"""
+# The page's fetch answers, kept to tell which bodies it never read (the worker counts as busy until
+# a body it gave is read). The last UNREAD_KEPT only.
+UNREAD_KEPT = 200
+PAGE_READS = """((max) => { const kept = []; const f = window.fetch;
+    window.fetch = function (...a) { const p = f.apply(this, a);
+        p.then((r) => { kept.push({at: Date.now(), r}); if (kept.length > max) kept.shift(); }, () => {});
+        return p; };
+    window.ocE2eUnread = () => kept.filter((k) => !k.r.bodyUsed).map((k) => k.at + ' ' + k.r.status + ' ' + k.r.url);
+})(%d)""" % UNREAD_KEPT
 
 
 def waiting_after_close(ctx, page):
@@ -2173,11 +2183,15 @@ def waiting_after_close(ctx, page):
         note("version", f"{v['versionId']} {v['status']} {v['runningStatus']} clients={v.get('controlledClients')}")
         for v in ev["versions"]])
     cdp.send("ServiceWorker.enable")
-    # A worker built with the inflight probe (a local diagnostic) answers with its unfinished events.
+    # The stack's worker (with e2e/sw_inflight.js) answers with its unfinished events.
     try:
         note("probe", "inflight " + json.dumps(page.evaluate(INFLIGHT_ASK, INFLIGHT_WAIT_MS)))
     except Exception as e:
         note("probe", f"inflight: {e}")
+    try:
+        note("probe", "unread bodies " + json.dumps(page.evaluate("() => window.ocE2eUnread ? window.ocE2eUnread() : 'no tracker'")))
+    except Exception as e:
+        note("probe", f"unread bodies: {e}")
     note("probe", "page closing")
     page.close()
     end = time.time() + WAIT_MS / 1000
