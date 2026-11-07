@@ -246,10 +246,9 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offer.png"))
     # What the user's Allow in the prompt does: notifications and push for this origin.
     ctx.grant_permissions(["notifications"], origin=BASE)
-    cdp = ctx.new_cdp_session(page)
-    cdp.send("Browser.setPermission", {
+    # Kept attached: the permission lasts as long as this session (detached, it is "default" again).
+    ctx.new_cdp_session(page).send("Browser.setPermission", {
         "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
-    cdp.detach()   # see behind()
     page.get_by_role("button", name="Enable notifications for replies").click()
     page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
     assert page.evaluate("() => window.ocPushState") == "saved"
