@@ -1,0 +1,16 @@
+// For Cloudflare's "Deploy to Cloudflare" button (README.md): the Worker example, from the repo's root so it
+// can import web/. No routes: add <your Open WebUI host>/oc-sw.js and /static/loader.js to the deployed Worker.
+// To deploy by hand, use examples/cloudflare-worker/wrangler.example.jsonc instead.
+{
+  "name": "open-webui-pwa-push",
+  "main": "examples/cloudflare-worker/src/index.js",
+  "compatibility_date": "2025-10-01",
+  "workers_dev": false,
+  // Import the two scripts as text.
+  "rules": [{ "type": "Text", "globs": ["**/oc-sw.js", "**/oc-push.js"], "fallthrough": true }],
+  "vars": {
+    // Offline open and instant chat open on; push off until you add VAPID_PUBLIC_KEY and FUNCTION_ID.
+    "OFFLINE": "1",
+    "CHAT_CACHE": "1"
+  }
+}

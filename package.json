@@ -1,0 +1,14 @@
+{
+  "name": "open-webui-pwa-push",
+  "private": true,
+  "description": "Push notifications, offline open and instant chat open for Open WebUI",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "cloudflare": {
+    "bindings": {
+      "OFFLINE": { "description": "`1`: Open WebUI opens offline with the chats read last. Anything else: off." },
+      "CHAT_CACHE": { "description": "`1` (with OFFLINE on): a chat opened before shows at once from the device." }
+    }
+  }
+}
