@@ -120,13 +120,19 @@ def seen_for(page, chat_id, n=1):
 def behind(ctx, page):
     """Another tab in front, so Open WebUI's page loses focus, as on a phone's home screen. A real
     tab through CDP, with Playwright's focus emulation off (it keeps every page focused). Call the result again to
-    put it in front again."""
+    put it in front again. Each CDP session is detached once used: one left attached to the page
+    undoes ctx.set_offline on its next load (navigator.onLine true, so no offline pill)."""
     cdp = ctx.new_cdp_session(page)
     tab = cdp.send("Target.createTarget", {"url": "about:blank"})["targetId"]
+    cdp.detach()
     def front():
-        cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})   # bring_to_front turns it on again
-        cdp.send("Target.activateTarget", {"targetId": tab})
-        page.wait_for_function("() => !document.hasFocus()", timeout=WAIT_MS)
+        s = ctx.new_cdp_session(page)
+        try:
+            s.send("Emulation.setFocusEmulationEnabled", {"enabled": False})   # bring_to_front turns it on again
+            s.send("Target.activateTarget", {"targetId": tab})
+            page.wait_for_function("() => !document.hasFocus()", timeout=WAIT_MS)
+        finally:
+            s.detach()
     front()
     return front
 
@@ -240,8 +246,11 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offer.png"))
     # What the user's Allow in the prompt does: notifications and push for this origin.
     ctx.grant_permissions(["notifications"], origin=BASE)
-    ctx.new_cdp_session(page).send("Browser.setPermission", {
+    # The permission lasts as long as this session (detached, it is "default" again), so it stays
+    # attached, on a tab of its own: one on the page undoes ctx.set_offline on its next load.
+    ctx.new_cdp_session(ctx.new_page()).send("Browser.setPermission", {
         "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
+    page.bring_to_front()
     page.get_by_role("button", name="Enable notifications for replies").click()
     page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
     assert page.evaluate("() => window.ocPushState") == "saved"
@@ -415,7 +424,7 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
                                   "session_id": "e2e"}, token)
     wait_done(token, p_chat, m_msg)
     end = time.time() + WAIT_MS / 1000
-    while f"chat {p_chat[:8]} is muted" not in owui_log(t_mute):
+    while f"chat is muted, nothing sent chat_id={p_chat}" not in owui_log(t_mute):
         assert time.time() < end, "the function never skipped the muted chat"
         time.sleep(0.3)
     assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"]["chat_id"] == p_chat and x["payload"]["message_id"] == m_msg]
@@ -503,7 +512,7 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
                                       "message_ids": [{"model_id": "stub", "message_id": msg, "modelIdx": 0}], "session_id": "e2e"}, token)
         if muted_by:
             wait_done(token, q_chat, msg)
-            muted_log(t, f"chat {q_chat[:8]}: folder {muted_by[:8]} is muted")
+            muted_log(t, f"folder {muted_by[:8]} is muted, nothing sent chat_id={q_chat}")
             assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"].get("message_id") == msg]
         else:
             page.wait_for_function("(m) => window.ocPushSeen.some(d => d.payload.message_id === m && d.shown)", arg=msg, timeout=WAIT_MS)
@@ -1073,7 +1082,9 @@ RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
 DROP_APP_FILE = """() => caches.open('oc-shell-v1').then(async (c) => {
     for (const k of await c.keys()) if (k.url.includes('/nodes/0.')) await c.delete(k); })"""
 SHELL_VERSION = "() => caches.open('oc-shell-v1').then((c) => c.match('/_oc/version')).then((r) => r ? r.text() : null)"
-NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-')))"
+# Offline open's caches (oc-sw.js SHELL, API_PREFIX); the push side's own (oc-push-*: an unsent
+# reply, the notifications it closed) are not offline open's and stay.
+NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-shell-') || k.startsWith('oc-api-')))"
 
 
 def offline_on():
