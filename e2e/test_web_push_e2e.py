@@ -2156,6 +2156,23 @@ def worker_offline(value):
     assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
 
 
+def waiting_after_close(ctx, page):
+    """A new worker still waiting: is the old one held by the page? The page closes, and Chrome's
+    own account of each version's status follows (CDP), for WAIT_MS."""
+    tab = ctx.new_page()   # about:blank keeps the browser up and carries the CDP session
+    cdp = ctx.new_cdp_session(tab)
+    cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: [
+        note("version", f"{v['versionId']} {v['status']} {v['runningStatus']} clients={v.get('controlledClients')}")
+        for v in ev["versions"]])
+    cdp.send("ServiceWorker.enable")
+    note("probe", "page closing")
+    page.close()
+    end = time.time() + WAIT_MS / 1000
+    while time.time() < end and not any("activated" in t and t.split()[2] == "1" for t in TRACE if " version " in t):
+        tab.wait_for_timeout(STATE_POLL_S * 1000)   # CDP events arrive while Playwright waits
+    note("probe", "done")
+
+
 @needs_offline
 @pytest.mark.skipif(not os.environ.get("E2E_RUN"), reason="set E2E_RUN=<run_dir> (stack.sh up) to turn the Worker's switch")
 def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
@@ -2172,8 +2189,12 @@ def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
         worker_offline("0")
         page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.update())")
         # The new worker takes over once the old one is idle; the next open comes after that.
-        settled(page, """() => navigator.serviceWorker.getRegistration('/').then((r) =>
-            r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
+        try:
+            settled(page, """() => navigator.serviceWorker.getRegistration('/').then((r) =>
+                r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
+        except AssertionError:
+            waiting_after_close(ctx, page)
+            raise
         page.reload()   # the next open
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         settled(page, NO_OFFLINE_CACHES)
