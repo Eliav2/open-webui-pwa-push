@@ -132,13 +132,17 @@
   // A short line at the top of the page (a reply that was not sent, a failed mute).
   // One that must be read (nothing can be sent) stays until it is tapped.
   const NOTICE_MS = 8000;
+  const NOTICE_RADIUS_PX = 14, NOTICE_PAD_PX = 10, NOTICE_PAD_X_EXTRA_PX = 4;
   function notice(text, { stay = false } = {}) {
     document.getElementById("oc-push-notice")?.remove();
     const n = document.createElement("div");
     n.id = "oc-push-notice";
     n.setAttribute("role", "status");
     n.dir = "auto";
-    n.style.cssText = pill + ";padding:8px 14px;max-width:min(90vw,420px);text-align:center";
+    // A rounded box, not the pill: a long notice wraps to several lines on a phone. Its own width
+    // (max-content, capped): from left:50% the box would otherwise only get half the screen.
+    n.style.cssText = pill + `;border-radius:${NOTICE_RADIUS_PX}px;padding:${NOTICE_PAD_PX}px ${NOTICE_PAD_PX + NOTICE_PAD_X_EXTRA_PX}px;` +
+      "box-sizing:border-box;width:max-content;max-width:min(90vw,420px);text-align:center";
     n.textContent = text;
     n.onclick = () => n.remove();
     document.body.appendChild(n);
