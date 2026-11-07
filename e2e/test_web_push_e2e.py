@@ -415,7 +415,7 @@ def test_preview_reply_mute_and_the_bell(owui, browser):
                                   "session_id": "e2e"}, token)
     wait_done(token, p_chat, m_msg)
     end = time.time() + WAIT_MS / 1000
-    while f"chat {p_chat[:8]} is muted" not in owui_log(t_mute):
+    while f"chat is muted, nothing sent chat_id={p_chat}" not in owui_log(t_mute):
         assert time.time() < end, "the function never skipped the muted chat"
         time.sleep(0.3)
     assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"]["chat_id"] == p_chat and x["payload"]["message_id"] == m_msg]
@@ -503,7 +503,7 @@ def test_one_notification_per_chat_and_the_folder_mute(owui, browser):
                                       "message_ids": [{"model_id": "stub", "message_id": msg, "modelIdx": 0}], "session_id": "e2e"}, token)
         if muted_by:
             wait_done(token, q_chat, msg)
-            muted_log(t, f"chat {q_chat[:8]}: folder {muted_by[:8]} is muted")
+            muted_log(t, f"folder {muted_by[:8]} is muted, nothing sent chat_id={q_chat}")
             assert not [x for x in page.evaluate("() => window.ocPushSeen") if x["payload"].get("message_id") == msg]
         else:
             page.wait_for_function("(m) => window.ocPushSeen.some(d => d.payload.message_id === m && d.shown)", arg=msg, timeout=WAIT_MS)
@@ -1073,7 +1073,9 @@ RELOADED_FLAG = "() => sessionStorage.getItem('ocReloadedAfterError')"
 DROP_APP_FILE = """() => caches.open('oc-shell-v1').then(async (c) => {
     for (const k of await c.keys()) if (k.url.includes('/nodes/0.')) await c.delete(k); })"""
 SHELL_VERSION = "() => caches.open('oc-shell-v1').then((c) => c.match('/_oc/version')).then((r) => r ? r.text() : null)"
-NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-')))"
+# Offline open's caches (oc-sw.js SHELL, API_PREFIX); the push side's own (oc-push-*: an unsent
+# reply, the notifications it closed) are not offline open's and stay.
+NO_OFFLINE_CACHES = "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-shell-') || k.startsWith('oc-api-')))"
 
 
 def offline_on():
