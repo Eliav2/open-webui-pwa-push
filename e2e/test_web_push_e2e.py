@@ -312,6 +312,12 @@ def trace(page):
     def failed(r):
         PENDING.pop(r, None)
         note("failed", f"{r.method} {r.url} {r.failure}")
+    def answered(res):
+        # A chat's reads: which copy each got (the kept one is marked), and from whom.
+        if TRACED_READS.search(urllib.parse.urlsplit(res.url).path):
+            h = res.headers
+            note("answer", f"{res.status} {res.request.method} {res.url} sw={res.from_service_worker}"
+                           f" {TRACE_HEADERS}={[h.get(k) for k in TRACE_HEADERS.split(',')]}")
     def console(m):
         if m.type in ("error", "warning"):
             note("console." + m.type, m.text[:TRACE_TEXT])
@@ -324,9 +330,12 @@ def trace(page):
     page.on("requestfailed", failed)
     page.on("console", console)
     page.on("pageerror", lambda e: note("pageerror", str(e)[:TRACE_TEXT]))
+    page.on("response", answered)
 
 
 TRACE_TEXT = 300   # characters kept of a message
+TRACED_READS = re.compile(r"^/api/(v1/chats/[\w-]+|tasks/chat/[\w-]+)$")   # a chat's own reads
+TRACE_HEADERS = "x-oc-kept,x-oc-open"   # oc-sw.js KEPT_HEADER, OPEN_READ
 
 
 @pytest.fixture(autouse=True)
@@ -1970,6 +1979,7 @@ def slow_network(ctx, token, chat_id):
         # The page's own reads too (those the worker lets through go from the page).
         if route.request.method != "GET" or "authorization" not in route.request.headers:
             return route.fallback()
+        note("held", f"sw={route.request.service_worker is not None} {route.request.url}")
         u = urllib.parse.urlsplit(route.request.url)
         route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{u.path}" + (f"?{u.query}" if u.query else ""))
     ctx.route("**/api/**", held)
@@ -1999,6 +2009,7 @@ def kept_then_fresh(page, gate, old, new):
     page.locator(UPDATING_PILL).wait_for(timeout=WAIT_MS)
     page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
     assert page.get_by_text(new).count() == 0
+    note("gate", "released")
     gate.set()
     try:
         page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
