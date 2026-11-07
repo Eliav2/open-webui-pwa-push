@@ -1440,12 +1440,13 @@ def test_start_reads_cut_by_a_network_change_still_open_the_chat(owui, pw):
 # page script and Open WebUI each wrap window.fetch: whoever reads it gets the top wrapper at that
 # time, and a call counts only when it goes to the top one, not from one wrapper to the next.
 OUTER_FETCH = """(path) => {
-    const seen = window.__ocOuter = {calls: 0, ends: 0};
+    const seen = window.__ocOuter = {calls: 0, ends: 0, sent: 0};
     const layers = [window.fetch];
     const view = (k) => function (input, init) {
         const p = layers[k].call(this, input, init);
-        if (k !== layers.length - 1) return p;
         if (new URL(input instanceof Request ? input.url : String(input), location.href).pathname !== path) return p;
+        if (k === 0) seen.sent++;   // the browser's own fetch: a request the page sends
+        if (k !== layers.length - 1) return p;
         seen.calls++;
         return p.finally(() => { seen.ends++; });
     };
@@ -1485,8 +1486,12 @@ def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui,
             # Every call Open WebUI made has its answer (it may ask the list more than once).
             page.wait_for_function("() => window.__ocOuter.ends >= 1 && window.__ocOuter.ends === window.__ocOuter.calls",
                                    timeout=WAIT_MS)
-            calls = page.evaluate("() => window.__ocOuter.calls")
-            assert attempts == [True] * (CUT_ATTEMPTS * calls), (calls, attempts)
+            calls, sent = page.evaluate("() => [window.__ocOuter.calls, window.__ocOuter.sent]")
+            # One request per call (the page asked none again), each one asked twice by the worker
+            # alone. Calls on their way together share one request (oc-sw.js shared()).
+            assert sent == calls, (calls, sent)
+            assert attempts and all(attempts), attempts
+            assert len(attempts) % CUT_ATTEMPTS == 0 and len(attempts) <= CUT_ATTEMPTS * calls, (calls, attempts)
         finally:
             ctx.unroute("**" + PINNED_PATH, cut_always)
     finally:
