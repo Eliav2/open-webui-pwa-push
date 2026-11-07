@@ -121,7 +121,7 @@ def behind(ctx, page):
     """Another tab in front, so Open WebUI's page loses focus, as on a phone's home screen. A real
     tab through CDP, with Playwright's focus emulation off (it keeps every page focused). Call the result again to
     put it in front again. Each CDP session is detached once used: one left attached to the page
-    undoes ctx.set_offline on its next load (navigator.onLine true again, so no offline pill)."""
+    undoes ctx.set_offline on its next load (navigator.onLine true, so no offline pill)."""
     cdp = ctx.new_cdp_session(page)
     tab = cdp.send("Target.createTarget", {"url": "about:blank"})["targetId"]
     cdp.detach()
@@ -246,9 +246,11 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
         page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offer.png"))
     # What the user's Allow in the prompt does: notifications and push for this origin.
     ctx.grant_permissions(["notifications"], origin=BASE)
-    # Kept attached: the permission lasts as long as this session (detached, it is "default" again).
-    ctx.new_cdp_session(page).send("Browser.setPermission", {
+    # The permission lasts as long as this session (detached, it is "default" again), so it stays
+    # attached, on a tab of its own: one on the page undoes ctx.set_offline on its next load.
+    ctx.new_cdp_session(ctx.new_page()).send("Browser.setPermission", {
         "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
+    page.bring_to_front()
     page.get_by_role("button", name="Enable notifications for replies").click()
     page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
     assert page.evaluate("() => window.ocPushState") == "saved"
