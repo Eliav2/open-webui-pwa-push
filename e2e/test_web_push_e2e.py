@@ -1065,6 +1065,11 @@ CHAT_TRIGGER = """(() => { let box = document.querySelector('a[href="/c/' + arg 
 ITEMS = "(m) => [...m.querySelectorAll('.app-dropdown-menu > button[role=menuitem]')].map(b => b.textContent.trim())"
 
 
+# A device of the user's that gets pushes, for a test that needs one to exist and sends it nothing.
+TAP_DEVICE = {"endpoint": "https://push.invalid/e2e-phone-tap", "keys": {"p256dh": "", "auth": ""},
+              "device": "e2e-phone-tap", "ua": "e2e", "at": 0}
+
+
 def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
     """A phone and a real touch: the tap on a folder's ⋯ in the sidebar lands on the folder's link
     (Open WebUI makes it a menu trigger too, aria-haspopup), not on the ⋯ button, and the same folder
@@ -1074,6 +1079,11 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
     folder = api("/api/v1/folders/", {"name": "Tap " + uuid.uuid4().hex[:4]}, token)["id"]
     chat, _ = new_chat(token, "stub", "Chat Tap")
     api(f"/api/v1/chats/{chat}/folder", {"folder_id": folder}, token)
+    # Mute is offered only to a user with a device that gets pushes (oc-push.js hasDevices). This
+    # test's own, not one an earlier test left: nothing replies while it runs, so nothing is sent to it.
+    before = valves(token)
+    api(VALVES_READ + "/update", {**before, "subscriptions": json.dumps(
+        json.loads(before["subscriptions"] or "[]") + [TAP_DEVICE])}, token)
     ctx = pw.chromium.launch_persistent_context(
         tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False, args=["--no-sandbox"],
         viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
@@ -1110,6 +1120,7 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
                                         "Edit", "Export", "Delete"]
     finally:
         ctx.close()
+        api(VALVES_READ + "/update", {**valves(token), "subscriptions": before["subscriptions"]}, token)
 
 
 def test_mute_from_open_webuis_own_menus(owui, browser):
