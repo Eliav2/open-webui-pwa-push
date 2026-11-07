@@ -2156,6 +2156,14 @@ def worker_offline(value):
     assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
 
 
+INFLIGHT_WAIT_MS = 3000   # a worker that answers at all does so at once
+INFLIGHT_ASK = """(ms) => new Promise((done) => {
+    navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data && e.data.type === 'oc-debug-inflight') done(e.data.list); });
+    navigator.serviceWorker.controller.postMessage({type: 'oc-debug-inflight'});
+    setTimeout(() => done('no answer (a worker without the probe)'), ms); })"""
+
+
 def waiting_after_close(ctx, page):
     """A new worker still waiting: is the old one held by the page? The page closes, and Chrome's
     own account of each version's status follows (CDP), for WAIT_MS."""
@@ -2165,6 +2173,11 @@ def waiting_after_close(ctx, page):
         note("version", f"{v['versionId']} {v['status']} {v['runningStatus']} clients={v.get('controlledClients')}")
         for v in ev["versions"]])
     cdp.send("ServiceWorker.enable")
+    # A worker built with the inflight probe (a local diagnostic) answers with its unfinished events.
+    try:
+        note("probe", "inflight " + json.dumps(page.evaluate(INFLIGHT_ASK, INFLIGHT_WAIT_MS)))
+    except Exception as e:
+        note("probe", f"inflight: {e}")
     note("probe", "page closing")
     page.close()
     end = time.time() + WAIT_MS / 1000
