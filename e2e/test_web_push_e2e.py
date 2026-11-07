@@ -198,11 +198,21 @@ def settled(page, check, arg=None):
     raise AssertionError("never settled: " + check[:120])
 
 
+def controlled(page):
+    """Waits until the service worker controls the page (its first load ran before it did)."""
+    try:
+        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    except Exception:
+        print(sw_diagnostics(page))
+        raise
+
+
 SW_STATE = """async () => { const r = await navigator.serviceWorker.getRegistration('/');
   const w = (x) => x && {state: x.state, url: x.scriptURL};
   return JSON.stringify({controller: w(navigator.serviceWorker.controller), active: w(r?.active),
     waiting: w(r?.waiting), installing: w(r?.installing), caches: await caches.keys(),
-    visible: document.visibilityState, url: location.href}); }"""
+    registrations: (await navigator.serviceWorker.getRegistrations()).length,
+    ocPushState: window.ocPushState ?? null, visible: document.visibilityState, url: location.href}); }"""
 
 
 def sw_diagnostics(page):
@@ -822,7 +832,7 @@ def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
         ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(BASE + "/")
-        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        controlled(page)
         page.evaluate("""([c, text]) => caches.open('oc-push-drafts').then((d) =>
             d.put('/oc-push/draft/' + c, new Response(JSON.stringify({text, at: Date.now()}))))""", [chat, "only once"])
         page.goto(f"{BASE}/c/{chat}?oc-reply=unsent")
@@ -1207,7 +1217,7 @@ OFFLINE_CACHES = "() => caches.keys()"
 def warm(page, chat):
     """The chat opened online under the service worker, so its reads and files are kept."""
     page.goto(f"{BASE}/c/{chat}")
-    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    controlled(page)
     page.reload()   # the first load ran before the worker controlled the page
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
     settled(page, """(c) => caches.keys().then(async (ks) => {
@@ -1314,7 +1324,7 @@ needs_chats = pytest.mark.skipif("not chats_on()", reason="kept chats are off on
 def opened(page, chat):
     """The chat opened under the service worker (both modes)."""
     page.goto(f"{BASE}/c/{chat}")
-    page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+    controlled(page)
     page.reload()
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
 
@@ -1457,7 +1467,7 @@ def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui,
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{BASE}/c/{chat}")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
+        controlled(page)
         page.reload()   # a load the worker answers: the app is kept
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         settled(page, f"() => caches.has({json.dumps(KEPT_APP)})")
