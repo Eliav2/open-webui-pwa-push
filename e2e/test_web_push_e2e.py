@@ -277,10 +277,12 @@ def pw():
 
 def chrome(pw):
     """Google Chrome with its own new profile, as a phone-sized window."""
-    return pw.chromium.launch_persistent_context(
+    ctx = pw.chromium.launch_persistent_context(
         tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
+    ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
+    return ctx
 
 
 @pytest.fixture(scope="module")
