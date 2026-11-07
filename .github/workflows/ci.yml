@@ -36,12 +36,12 @@ jobs:
           ./actionlint -color
 
   web:
-    name: Service worker and page script (node --test)
+    name: Service worker, page script and Worker (node --test)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - run: node --test web/*.test.js
+      - run: node --test web/*.test.js examples/cloudflare-worker/*.test.js
 
   test:
     name: Function (py${{ matrix.python-version }})

@@ -10,6 +10,7 @@
     { "pattern": "chat.example.com/static/loader.js", "zone_name": "example.com" }
   ],
   "vars": {
+    // Push notifications: both, or leave both out for the service worker only (offline open, kept chats).
     "VAPID_PUBLIC_KEY": "<your VAPID public key, base64url>",
     "FUNCTION_ID": "openclaw_web_push",
     // Optional, "1" = on (README.md): offline open, and a chat opened before shown at once.

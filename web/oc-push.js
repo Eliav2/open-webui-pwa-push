@@ -3,13 +3,22 @@
 // append it to yours. Replace the two placeholders when you serve it:
 //   __VAPID_PUBLIC_KEY__  the VAPID public key, base64url (not a secret)
 //   __FUNCTION_ID__       the id of the Web Push event function in Open WebUI
+// Left empty (or not replaced), push is off: the service worker only (offline
+// open, kept chats), with no "Enable notifications", bell or mute items.
 // It registers /oc-sw.js and keeps this device's push subscription in that
 // function's user valves, through Open WebUI's own API with the user's token.
 // In a chat it adds a bell (mute this chat for every device of the user) and
 // puts a reply that could not be sent from a notification into the message box.
 (() => {
   const VAPID = "__VAPID_PUBLIC_KEY__", FN = "__FUNCTION_ID__";
-  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return;
+  if (!("serviceWorker" in navigator)) return;
+  // A placeholder the proxy did not fill in still starts with its marker.
+  const PLACEHOLDER = "__";
+  const given = (v) => !!v && !v.startsWith(PLACEHOLDER);
+  // Push: both given by the proxy, and a browser with Web Push. Without it, the
+  // service worker alone (SW-only mode): no offer, no subscription, no mute.
+  const PUSH = given(VAPID) && given(FN) && "PushManager" in window && "Notification" in window;
+  const PUSH_OFF = "push-off";   // window.ocPushState then
   const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
     (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
@@ -70,6 +79,7 @@
     // registers ours again on the next page load.
     const reg = await navigator.serviceWorker.register("/oc-sw.js", { scope: "/" });
     await navigator.serviceWorker.ready;
+    if (!PUSH) return PUSH_OFF;
     if (Notification.permission !== "granted") return "no-permission";
     const user = (await call("/api/v1/auths/"))?.id;
     let sub = await reg.pushManager.getSubscription();
@@ -577,7 +587,7 @@
 
   async function chatPage() {
     seen(chatIdNow()).catch(() => {});
-    if (!store.get("token")) return;
+    if (!store.get("token") || !PUSH) return;
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
     pendingReply();
@@ -628,7 +638,7 @@
     const id = chatIdNow();
     seen(id).catch(() => {});
     // Mutes may have changed on another device.
-    if (store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
+    if (PUSH && store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
 
   // A tap on a notification while this page is open: the service worker asks
@@ -780,9 +790,9 @@
     }
     window[CONTRACT[chat ? "chat" : "folder"]] = "ok";
     if (!store.get("token")) return;
-    if (mutes === null) await loadMutes().catch(() => {});
-    if (chat) await loadFolder(chat, true).catch(() => {});   // a chat can move to another folder
-    if (!chat) await loadFolders().catch(() => {});
+    if (PUSH && mutes === null) await loadMutes().catch(() => {});
+    if (PUSH && chat) await loadFolder(chat, true).catch(() => {});   // a chat can move to another folder
+    if (PUSH && !chat) await loadFolders().catch(() => {});
     const put = () => {
       if (!menu.isConnected) return;
       let prev = native;
