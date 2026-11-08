@@ -65,7 +65,9 @@ docker run -d --name "$name" -p "127.0.0.1:$owui_port:8080" \
   first_match healthy docker events --since "$since" --filter "container=$name" --filter "event=health_status: healthy"
 # The Worker example, its two scripts and a dev config (no routes: wrangler dev sends every path to it).
 cp "$root/examples/cloudflare-worker/src/index.js" "$run/worker/src/index.js"
-mkdir -p "$run/web"; cp "$root/web/oc-sw.js" "$root/web/oc-push.js" "$run/web/"
+mkdir -p "$run/web"; cp "$root/web/oc-push.js" "$run/web/"
+# The stack's worker also answers what it is still busy with (e2e/sw_inflight.js, tests only).
+cat "$here/sw_inflight.js" "$root/web/oc-sw.js" > "$run/web/oc-sw.js"
 sed -i 's#\.\./\.\./\.\./web/#../web/#' "$run/worker/src/index.js"
 rm -rf "$run/worker/web"; mv "$run/web" "$run/worker/web"   # a second `up` on the same run dir would nest it
 cat > "$run/worker/wrangler.jsonc" <<JSON
