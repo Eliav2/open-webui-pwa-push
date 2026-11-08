@@ -200,8 +200,15 @@ def settled(page, check, arg=None):
 
 
 def controlled(page):
-    """Waits until the service worker controls the page (its first load ran before it did)."""
+    """Waits until the service worker controls the page (its first load ran before it did). The
+    worker claims the pages open when it activates (oc-sw.js clients.claim()); a document that
+    began loading before then and came after the claim (a reload of a page whose app failed to
+    load) is controlled only from its next navigation, as the service worker lifecycle defines."""
     try:
+        settled(page, "() => navigator.serviceWorker.getRegistration('/').then((r) => !!(r && r.active))")
+        if not page.evaluate("() => !!navigator.serviceWorker.controller"):
+            note("controlled", "an active worker, this document not claimed: its next navigation")
+            page.reload()
         page.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=WAIT_MS)
     except Exception:
         print(sw_diagnostics(page))
@@ -280,18 +287,44 @@ TRACE_MAX = 300   # the page events a failed test reports (the last ones)
 TRACE = collections.deque(maxlen=TRACE_MAX)
 PENDING = {}      # the page's requests with no answer yet -> their url
 TRACED = []       # the pages traced (the module's browser page stays across tests)
+SW_PENDING = {}   # the service workers' own requests with no answer yet -> when and what
+
+
+def note(kind, detail):
+    TRACE.append(f"{time.time():.3f} {kind} {detail}")
+
+
+def asked(r):
+    return f"{time.time():.3f} {r.method} {r.url}"
+
+
+def trace_workers(ctx):
+    """The service workers' own requests (to the network), beside the pages'."""
+    def started(r):
+        if r.service_worker is not None:
+            SW_PENDING[r] = asked(r)
+    def failed(r):
+        if SW_PENDING.pop(r, None) is not None:
+            note("sw.failed", f"{r.method} {r.url} {r.failure}")
+    ctx.on("request", started)
+    ctx.on("requestfinished", lambda r: SW_PENDING.pop(r, None))
+    ctx.on("requestfailed", failed)
 
 
 def trace(page):
     """A page's loads, failed requests and errors, for the report of a test that fails."""
-    def note(kind, detail):
-        TRACE.append(f"{time.time():.3f} {kind} {detail}")
     def navigated(frame):
         if frame == page.main_frame:
             note("nav", frame.url)
     def failed(r):
         PENDING.pop(r, None)
         note("failed", f"{r.method} {r.url} {r.failure}")
+    def answered(res):
+        # A chat's reads: which copy each got (the kept one is marked), and from whom.
+        if TRACED_READS.search(urllib.parse.urlsplit(res.url).path):
+            h = res.headers
+            note("answer", f"{res.status} {res.request.method} {res.url} sw={res.from_service_worker}"
+                           f" {TRACE_HEADERS}={[h.get(k) for k in TRACE_HEADERS.split(',')]}")
     def console(m):
         if m.type in ("error", "warning"):
             note("console." + m.type, m.text[:TRACE_TEXT])
@@ -299,14 +332,17 @@ def trace(page):
     page.on("framenavigated", navigated)
     page.on("domcontentloaded", lambda p: note("domcontentloaded", p.url))
     page.on("load", lambda p: note("load", p.url))
-    page.on("request", lambda r: PENDING.__setitem__(r, f"{r.method} {r.url}"))
+    page.on("request", lambda r: PENDING.__setitem__(r, asked(r)))
     page.on("requestfinished", lambda r: PENDING.pop(r, None))
     page.on("requestfailed", failed)
     page.on("console", console)
     page.on("pageerror", lambda e: note("pageerror", str(e)[:TRACE_TEXT]))
+    page.on("response", answered)
 
 
 TRACE_TEXT = 300   # characters kept of a message
+TRACED_READS = re.compile(r"^/api/(v1/chats/[\w-]+|tasks/chat/[\w-]+)$")   # a chat's own reads
+TRACE_HEADERS = "x-oc-kept,x-oc-open"   # oc-sw.js KEPT_HEADER, OPEN_READ
 
 
 @pytest.fixture(autouse=True)
@@ -314,6 +350,7 @@ def page_trace(request):
     """On a failure: what the pages did last, what they still wait for, and their service worker."""
     TRACE.clear()
     PENDING.clear()
+    SW_PENDING.clear()
     TRACED[:] = [p for p in TRACED if not p.is_closed()]
     yield
     rep = getattr(request.node, "rep_call", None)
@@ -323,6 +360,8 @@ def page_trace(request):
     print("\n".join(TRACE))
     print("--- requests still without an answer")
     print("\n".join(PENDING.values()) or "(none)")
+    print("--- the service workers' requests still without an answer")
+    print("\n".join(SW_PENDING.values()) or "(none)")
     for page in list(TRACED):   # (the diagnostics' own tab joins the list)
         if not page.is_closed():
             print(sw_diagnostics(page))
@@ -335,9 +374,11 @@ def chrome(pw):
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
     ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
+    ctx.add_init_script(PAGE_READS)
     for page in ctx.pages:
         trace(page)
     ctx.on("page", trace)
+    trace_workers(ctx)
     return ctx
 
 
@@ -1032,6 +1073,12 @@ CHAT_TRIGGER = """(() => { let box = document.querySelector('a[href="/c/' + arg 
 ITEMS = "(m) => [...m.querySelectorAll('.app-dropdown-menu > button[role=menuitem]')].map(b => b.textContent.trim())"
 
 
+NO_SUBSCRIPTIONS = "[]"   # the function's default for the subscriptions valve
+# A device of the user's that gets pushes, for a test that needs one to exist and sends it nothing.
+TAP_DEVICE = {"endpoint": "https://push.invalid/e2e-phone-tap", "keys": {"p256dh": "", "auth": ""},
+              "device": "e2e-phone-tap", "ua": "e2e", "at": 0}
+
+
 def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
     """A phone and a real touch: the tap on a folder's ⋯ in the sidebar lands on the folder's link
     (Open WebUI makes it a menu trigger too, aria-haspopup), not on the ⋯ button, and the same folder
@@ -1041,6 +1088,11 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
     folder = api("/api/v1/folders/", {"name": "Tap " + uuid.uuid4().hex[:4]}, token)["id"]
     chat, _ = new_chat(token, "stub", "Chat Tap")
     api(f"/api/v1/chats/{chat}/folder", {"folder_id": folder}, token)
+    # Mute is offered only to a user with a device that gets pushes (oc-push.js hasDevices). This
+    # test's own, not one an earlier test left: nothing replies while it runs, so nothing is sent to it.
+    before = valves(token)
+    saved = before.get("subscriptions") or NO_SUBSCRIPTIONS   # a user who never saved any has none set
+    api(VALVES_READ + "/update", {**before, "subscriptions": json.dumps(json.loads(saved) + [TAP_DEVICE])}, token)
     ctx = pw.chromium.launch_persistent_context(
         tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False, args=["--no-sandbox"],
         viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
@@ -1077,6 +1129,7 @@ def test_a_real_tap_on_a_folders_menu_is_seen_on_a_phone(owui, pw):
                                         "Edit", "Export", "Delete"]
     finally:
         ctx.close()
+        api(VALVES_READ + "/update", {**valves(token), "subscriptions": saved}, token)
 
 
 def test_mute_from_open_webuis_own_menus(owui, browser):
@@ -1513,6 +1566,68 @@ OUTER_FETCH = """(path) => {
 }"""
 
 
+HOLD_INSTALL = "oc-e2e-hold-install"   # e2e/sw_inflight.js: a worker installing waits while this cache exists
+FIRST_VERSION_ID = "0"   # Chrome's id for a fresh profile's first version of the worker (CDP)
+HELPER_PATH = "/manifest.json"   # any page of the site
+INSTALL_GO = """() => navigator.serviceWorker.getRegistration('/').then((r) =>
+    r && r.installing && r.installing.postMessage({type: 'oc-e2e-install-go'}))"""
+
+
+def test_a_page_reloaded_before_its_worker_activated_comes_under_it(owui, pw):
+    """A page reloaded while its worker installs (Open WebUI's app failing on a fresh device's first
+    load, and the page script reloading it, ELI-352): the reload leaves before the worker is active,
+    and its page comes after the worker claimed the pages open. No claim reaches it: only its next
+    navigation is controlled, and controlled() must get there (the old helper waited for a claim
+    that never comes). The order is made here: the worker's install waits (e2e/sw_inflight.js) until
+    the reload is on its way, and the reload waits until the worker is active."""
+    chat, _ = new_chat(owui, "stub", "Chat Reloaded While Installing")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    ctx.add_init_script(f"caches.open({json.dumps(HOLD_INSTALL)})")
+    reload, status = [], {}
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    def reload_of_the_page(route):
+        if not route.request.is_navigation_request() or route.request.service_worker is not None or reload:
+            return route.fallback()
+        reload.append(route)   # let go from the test, not in this handler
+    tab = ctx.new_page()   # Chrome's account of the worker (CDP), beside the page
+    helper = ctx.new_page()   # a page of the site that is not reloading
+    cdp = ctx.new_cdp_session(tab)
+    cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: status.update(
+        {v["versionId"]: v["status"] for v in ev["versions"]}))
+    cdp.send("ServiceWorker.enable")
+    def until(state, past=()):
+        # Waits for state, and fails at once when the worker is already in a status past it (the
+        # state can no longer come), with what was seen.
+        end = time.time() + WAIT_MS / 1000
+        while time.time() < end and not state() and status.get(FIRST_VERSION_ID) not in past:
+            tab.wait_for_timeout(STATE_POLL_S * 1000)   # routes and CDP events arrive while Playwright waits
+        assert state(), (reload, status)
+    try:
+        page.goto(f"{BASE}/c/{chat}")
+        # Installed or later here: the install was not held, and nothing below is.
+        until(lambda: status.get(FIRST_VERSION_ID) == "installing", past=("installed", "activating", "activated", "redundant"))
+        ctx.route(f"**/c/{chat}", reload_of_the_page)
+        page.evaluate("() => { setTimeout(() => location.reload()); }")   # after this evaluate returns
+        until(lambda: reload, past=("installed", "activating", "activated", "redundant"))
+        # The go comes from another page of the site: the page itself is between two documents now
+        # (Playwright would wait for the held one), and only the go lets that one come.
+        helper.goto(BASE + HELPER_PATH)
+        helper.evaluate(INSTALL_GO)
+        until(lambda: status.get(FIRST_VERSION_ID) == "activated", past=("redundant",))   # it claimed the page still open
+        reload.pop().fallback()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert not page.evaluate("() => !!navigator.serviceWorker.controller")   # the case: not claimed
+        controlled(page)
+    finally:
+        # A failure lets go of what it holds: the install, and the reload.
+        if helper.url.startswith(BASE):
+            helper.evaluate(INSTALL_GO)
+        for r in reload:
+            r.fallback()
+        ctx.close()
+
+
 @needs_offline
 def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui, pw):
     """Offline open on: the worker already asks a cut start read once more (oc-sw.js again()). A
@@ -1946,6 +2061,7 @@ def slow_network(ctx, token, chat_id):
         # The page's own reads too (those the worker lets through go from the page).
         if route.request.method != "GET" or "authorization" not in route.request.headers:
             return route.fallback()
+        note("held", f"sw={route.request.service_worker is not None} {route.request.url}")
         u = urllib.parse.urlsplit(route.request.url)
         route.continue_(url=f"http://127.0.0.1:{srv.server_address[1]}{u.path}" + (f"?{u.query}" if u.query else ""))
     ctx.route("**/api/**", held)
@@ -1975,6 +2091,7 @@ def kept_then_fresh(page, gate, old, new):
     page.locator(UPDATING_PILL).wait_for(timeout=WAIT_MS)
     page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
     assert page.get_by_text(new).count() == 0
+    note("gate", "released")
     gate.set()
     try:
         page.get_by_text(new).first.wait_for(timeout=WAIT_MS)
@@ -2102,9 +2219,71 @@ def test_a_sign_out_drops_the_kept_chats(owui, pw):
 
 def worker_offline(value):
     """The stack Worker's OFFLINE var, the Worker restarted with it (stack.sh offline)."""
+    note("worker", f"OFFLINE={value}: restarting")
     subprocess.run(["bash", os.path.join(HERE, "stack.sh"), "offline", os.environ["E2E_RUN"], value],
                    check=True, capture_output=True, timeout=WAIT_MS / 1000)
+    note("worker", f"OFFLINE={value}: up")
     assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
+
+
+INFLIGHT_WAIT_MS = 3000   # a worker that answers at all does so at once
+INFLIGHT_ASK = """(ms) => new Promise((done) => {
+    navigator.serviceWorker.addEventListener('message', (e) => {
+        if (e.data && e.data.type === 'oc-e2e-inflight') done(e.data.list); });
+    navigator.serviceWorker.controller.postMessage({type: 'oc-e2e-inflight'});
+    setTimeout(() => done('no answer (a worker without e2e/sw_inflight.js)'), ms); })"""
+# The page's fetch answers, kept to tell which bodies it never read (the worker counts as busy until
+# a body it gave is read). The last UNREAD_KEPT only.
+UNREAD_KEPT = 200
+PAGE_READS = """((max) => { const kept = []; const f = window.fetch;
+    window.fetch = function (...a) { const p = f.apply(this, a);
+        p.then((r) => { kept.push({at: Date.now(), r}); if (kept.length > max) kept.shift(); }, () => {});
+        return p; };
+    window.ocE2eUnread = () => kept.filter((k) => !k.r.bodyUsed).map((k) => k.at + ' ' + k.r.status + ' ' + k.r.url);
+})(%d)""" % UNREAD_KEPT
+
+
+NEW_VERSION_ID = "1"   # Chrome's id for a fresh profile's second version of the worker (CDP)
+
+
+def waiting_after_close(ctx, page):
+    """A new worker still waiting: what holds the old one? Its unfinished events, the page's unread
+    bodies; then the new one asked to skip waiting again with the page open, and if it still waits,
+    the page closed. Chrome's own account of each version's status (CDP) throughout."""
+    tab = ctx.new_page()   # about:blank keeps the browser up and carries the CDP session
+    cdp = ctx.new_cdp_session(tab)
+    cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: [
+        note("version", f"{v['versionId']} {v['status']} {v['runningStatus']} clients={v.get('controlledClients')}")
+        for v in ev["versions"]])
+    cdp.send("ServiceWorker.enable")
+    # The stack's worker (with e2e/sw_inflight.js) answers with its unfinished events.
+    try:
+        note("probe", "inflight " + json.dumps(page.evaluate(INFLIGHT_ASK, INFLIGHT_WAIT_MS)))
+    except Exception as e:
+        note("probe", f"inflight: {e}")
+    try:
+        note("probe", "unread bodies " + json.dumps(page.evaluate("() => window.ocE2eUnread ? window.ocE2eUnread() : 'no tracker'")))
+    except Exception as e:
+        note("probe", f"unread bodies: {e}")
+    # The waiting worker skips waiting again, the page still open: taking over now means its first
+    # skipWaiting was missed; staying means the old worker is held by something no script sees.
+    page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.waiting?.postMessage({type: 'oc-e2e-skip'}))")
+    note("probe", "asked the waiting worker to skip waiting again (page open)")
+    if not took_over(tab):
+        note("probe", "still waiting with the page open; page closing")
+        page.close()
+        took_over(tab)
+    note("probe", "done")
+
+
+def took_over(tab):
+    """Whether the new version reports activated (CDP), within WAIT_MS."""
+    end = time.time() + WAIT_MS / 1000
+    while time.time() < end:
+        if any(t.split()[2:4] == [NEW_VERSION_ID, "activated"] for t in TRACE if " version " in t):
+            return True
+        tab.wait_for_timeout(STATE_POLL_S * 1000)   # CDP events arrive while Playwright waits
+    return False
 
 
 @needs_offline
@@ -2123,8 +2302,12 @@ def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
         worker_offline("0")
         page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.update())")
         # The new worker takes over once the old one is idle; the next open comes after that.
-        settled(page, """() => navigator.serviceWorker.getRegistration('/').then((r) =>
-            r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
+        try:
+            settled(page, """() => navigator.serviceWorker.getRegistration('/').then((r) =>
+                r.active && r.active.state === 'activated' && !r.waiting && !r.installing)""")
+        except AssertionError:
+            waiting_after_close(ctx, page)
+            raise
         page.reload()   # the next open
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
         settled(page, NO_OFFLINE_CACHES)
