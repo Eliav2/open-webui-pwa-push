@@ -18,7 +18,14 @@ ExtendableEvent.prototype.waitUntil = function (p) {
   ocE2eTrack("waitUntil " + this.type + " " + (this.request ? this.request.url : ""), p);
   return ocE2eWaitUntil.call(this, p);
 };
+// A test that needs a reload to leave before the worker is active holds its install (a cache of that
+// name, made by the test's page) until it says go.
+const OC_E2E_HOLD_INSTALL = "oc-e2e-hold-install";
+let ocE2eInstallGo = null;
+self.addEventListener("install", (e) => e.waitUntil(caches.has(OC_E2E_HOLD_INSTALL).then((hold) =>
+  hold && new Promise((go) => { ocE2eInstallGo = go; }))));
 self.addEventListener("message", (e) => {
+  if (e.data && e.data.type === "oc-e2e-install-go" && ocE2eInstallGo) ocE2eInstallGo();
   if (e.data && e.data.type === "oc-e2e-inflight")
     e.source.postMessage({ type: "oc-e2e-inflight", list: [...ocE2eInflight.values()] });
   // A waiting worker asked to skip waiting again: does it take over with the page still open?
