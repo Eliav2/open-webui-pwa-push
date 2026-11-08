@@ -1,7 +1,7 @@
 """
 title: Web Push notifications
-author: eliavb43
-author_url: https://github.com/Eliav2/openclaw-openwebui-integration
+author: Eliav2
+author_url: https://github.com/Eliav2/open-webui-pwa-push
 version: 0.6.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
