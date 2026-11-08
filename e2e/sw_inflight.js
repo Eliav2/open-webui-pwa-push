@@ -24,8 +24,25 @@ const OC_E2E_HOLD_INSTALL = "oc-e2e-hold-install";
 let ocE2eInstallGo = null;
 self.addEventListener("install", (e) => e.waitUntil(caches.has(OC_E2E_HOLD_INSTALL).then((hold) =>
   hold && new Promise((go) => { ocE2eInstallGo = go; }))));
+// A test that needs this worker busy holds one of its fetches (OC_E2E_HOLD_FETCH) until it says go.
+// Registered before oc-sw.js's own: that one never sees the request.
+const OC_E2E_HOLD_FETCH = "/oc-e2e-hold-fetch";
+let ocE2eFetchGo = null;
+// Or answers it at once and keeps the event open (waitUntil) instead (OC_E2E_HOLD_WAIT).
+const OC_E2E_HOLD_WAIT = "/oc-e2e-hold-wait";
+self.addEventListener("fetch", (e) => {
+  const path = new URL(e.request.url).pathname;
+  if (path !== OC_E2E_HOLD_FETCH && path !== OC_E2E_HOLD_WAIT) return;
+  e.stopImmediatePropagation();
+  const held = new Promise((go) => { ocE2eFetchGo = go; });
+  if (path === OC_E2E_HOLD_WAIT) {
+    e.waitUntil(held);
+    e.respondWith(new Response("go"));
+  } else e.respondWith(held.then(() => new Response("go")));
+});
 self.addEventListener("message", (e) => {
   if (e.data && e.data.type === "oc-e2e-install-go" && ocE2eInstallGo) ocE2eInstallGo();
+  if (e.data && e.data.type === "oc-e2e-fetch-go" && ocE2eFetchGo) ocE2eFetchGo();
   if (e.data && e.data.type === "oc-e2e-inflight")
     e.source.postMessage({ type: "oc-e2e-inflight", list: [...ocE2eInflight.values()] });
   // A waiting worker asked to skip waiting again: does it take over with the page still open?
