@@ -1566,6 +1566,68 @@ OUTER_FETCH = """(path) => {
 }"""
 
 
+HOLD_INSTALL = "oc-e2e-hold-install"   # e2e/sw_inflight.js: a worker installing waits while this cache exists
+FIRST_VERSION_ID = "0"   # Chrome's id for a fresh profile's first version of the worker (CDP)
+HELPER_PATH = "/manifest.json"   # any page of the site
+INSTALL_GO = """() => navigator.serviceWorker.getRegistration('/').then((r) =>
+    r && r.installing && r.installing.postMessage({type: 'oc-e2e-install-go'}))"""
+
+
+def test_a_page_reloaded_before_its_worker_activated_comes_under_it(owui, pw):
+    """A page reloaded while its worker installs (Open WebUI's app failing on a fresh device's first
+    load, and the page script reloading it, ELI-352): the reload leaves before the worker is active,
+    and its page comes after the worker claimed the pages open. No claim reaches it: only its next
+    navigation is controlled, and controlled() must get there (the old helper waited for a claim
+    that never comes). The order is made here: the worker's install waits (e2e/sw_inflight.js) until
+    the reload is on its way, and the reload waits until the worker is active."""
+    chat, _ = new_chat(owui, "stub", "Chat Reloaded While Installing")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    ctx.add_init_script(f"caches.open({json.dumps(HOLD_INSTALL)})")
+    reload, status = [], {}
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    def reload_of_the_page(route):
+        if not route.request.is_navigation_request() or route.request.service_worker is not None or reload:
+            return route.fallback()
+        reload.append(route)   # let go from the test, not in this handler
+    tab = ctx.new_page()   # Chrome's account of the worker (CDP), beside the page
+    helper = ctx.new_page()   # a page of the site that is not reloading
+    cdp = ctx.new_cdp_session(tab)
+    cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: status.update(
+        {v["versionId"]: v["status"] for v in ev["versions"]}))
+    cdp.send("ServiceWorker.enable")
+    def until(state, past=()):
+        # Waits for state, and fails at once when the worker is already in a status past it (the
+        # state can no longer come), with what was seen.
+        end = time.time() + WAIT_MS / 1000
+        while time.time() < end and not state() and status.get(FIRST_VERSION_ID) not in past:
+            tab.wait_for_timeout(STATE_POLL_S * 1000)   # routes and CDP events arrive while Playwright waits
+        assert state(), (reload, status)
+    try:
+        page.goto(f"{BASE}/c/{chat}")
+        # Installed or later here: the install was not held, and nothing below is.
+        until(lambda: status.get(FIRST_VERSION_ID) == "installing", past=("installed", "activating", "activated", "redundant"))
+        ctx.route(f"**/c/{chat}", reload_of_the_page)
+        page.evaluate("() => { setTimeout(() => location.reload()); }")   # after this evaluate returns
+        until(lambda: reload, past=("installed", "activating", "activated", "redundant"))
+        # The go comes from another page of the site: the page itself is between two documents now
+        # (Playwright would wait for the held one), and only the go lets that one come.
+        helper.goto(BASE + HELPER_PATH)
+        helper.evaluate(INSTALL_GO)
+        until(lambda: status.get(FIRST_VERSION_ID) == "activated", past=("redundant",))   # it claimed the page still open
+        reload.pop().fallback()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert not page.evaluate("() => !!navigator.serviceWorker.controller")   # the case: not claimed
+        controlled(page)
+    finally:
+        # A failure lets go of what it holds: the install, and the reload.
+        if helper.url.startswith(BASE):
+            helper.evaluate(INSTALL_GO)
+        for r in reload:
+            r.fallback()
+        ctx.close()
+
+
 @needs_offline
 def test_a_start_read_the_worker_gave_up_on_is_not_asked_again_by_the_page(owui, pw):
     """Offline open on: the worker already asks a cut start read once more (oc-sw.js again()). A
