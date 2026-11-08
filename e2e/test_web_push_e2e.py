@@ -2226,6 +2226,66 @@ def worker_offline(value):
     assert f'OFFLINE_SETTING = "{value}"' in urllib.request.urlopen(BASE + "/oc-sw.js", timeout=30).read().decode()
 
 
+
+HOLD_FETCH = "/oc-e2e-hold-fetch"   # e2e/sw_inflight.js: a fetch the worker answers only on 'oc-e2e-fetch-go'
+HOLD_WAIT = "/oc-e2e-hold-wait"     # e2e/sw_inflight.js: answered at once, the event kept open (waitUntil) until go
+
+
+def old_worker_busy(owui, pw, hold):
+    """A new worker installed while the old one is still busy with an event (skipWaiting already
+    called in its install) must take over as soon as that event ends, with the page still open:
+    nothing else comes to let it in. The event is a fetch the old worker answers late (HOLD_FETCH,
+    respondWith held) or answers at once and keeps open (HOLD_WAIT, waitUntil held), both in
+    e2e/sw_inflight.js; released once the new worker is installed. (A request the worker lets go to
+    the network does not hold the new one at all: it activates while that request is on its way.)"""
+    chat, _ = new_chat(owui, "stub", "Chat Old Worker Busy")
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    status = {}
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        tab = ctx.new_page()   # Chrome's account of the workers (CDP), beside the page
+        cdp = ctx.new_cdp_session(tab)
+        cdp.on("ServiceWorker.workerVersionUpdated", lambda ev: status.update(
+            {v["versionId"]: v["status"] for v in ev["versions"]}))
+        cdp.send("ServiceWorker.enable")
+        def until(state, past=()):
+            # Waits for state; fails at once when the new worker is already past it, with what was seen.
+            end = time.time() + WAIT_MS / 1000
+            while time.time() < end and not state() and status.get(NEW_VERSION_ID) not in past:
+                tab.wait_for_timeout(STATE_POLL_S * 1000)   # CDP events arrive while Playwright waits
+            assert state(), status
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        controlled(page)
+        page.evaluate(f"() => {{ window.ocE2eHeld = fetch({json.dumps(hold)}).then((r) => r.text()); }}")
+        settled(page, f"""() => new Promise((done) => {{
+            navigator.serviceWorker.addEventListener('message', (e) => {{
+                if (e.data && e.data.type === 'oc-e2e-inflight') done(e.data.list.some((x) => x.includes({json.dumps(hold)}))); }});
+            navigator.serviceWorker.controller.postMessage({{type: 'oc-e2e-inflight'}}); }})""")
+        worker_offline("0")
+        page.evaluate("() => navigator.serviceWorker.getRegistration('/').then((r) => r.update())")
+        # Installed and its skipWaiting called: it can only wait for the old worker's event now.
+        until(lambda: status.get(NEW_VERSION_ID) == "installed", past=("activating", "activated", "redundant"))
+        page.evaluate("() => navigator.serviceWorker.controller.postMessage({type: 'oc-e2e-fetch-go'})")
+        assert page.evaluate("() => window.ocE2eHeld") == "go"
+        until(lambda: status.get(NEW_VERSION_ID) == "activated", past=("redundant",))
+    finally:
+        ctx.close()
+        worker_offline("1")
+
+
+@needs_offline
+@pytest.mark.skipif(not os.environ.get("E2E_RUN"), reason="set E2E_RUN=<run_dir> (stack.sh up) to turn the Worker's switch")
+def test_a_new_worker_takes_over_once_the_old_ones_late_answer_ends(owui, pw):
+    old_worker_busy(owui, pw, HOLD_FETCH)
+
+
+@needs_offline
+@pytest.mark.skipif(not os.environ.get("E2E_RUN"), reason="set E2E_RUN=<run_dir> (stack.sh up) to turn the Worker's switch")
+def test_a_new_worker_takes_over_once_the_old_ones_open_event_ends(owui, pw):
+    old_worker_busy(owui, pw, HOLD_WAIT)
+
 INFLIGHT_WAIT_MS = 3000   # a worker that answers at all does so at once
 INFLIGHT_ASK = """(ms) => new Promise((done) => {
     navigator.serviceWorker.addEventListener('message', (e) => {
