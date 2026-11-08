@@ -12,7 +12,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd); root=$(dirname "$here")
 cmd=$1; run=$2
-OWUI_IMAGE=${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.0}
+OWUI_IMAGE=${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.2}
 name=${E2E_NAME:-owui-webpush-e2e}
 owui_port=${E2E_OWUI_PORT:-18780}; worker_port=${E2E_WORKER_PORT:-18787}; inspector_port=${E2E_INSPECTOR_PORT:-18797}
 if [ "$cmd" = down ]; then

@@ -520,30 +520,47 @@
 
   // First in the header's right-hand controls (before the chat menu ⋯, which
   // Open WebUI shows only to users who may share), styled like its buttons.
+  // Open WebUI 0.13.2 on a wide screen hides that header row and draws the
+  // chat's ⋯ in the chat's tab instead: there the bell goes just before it.
   // Open WebUI redraws its header freely: an observer puts the bell back.
   const HEADER_BUTTON = "flex shrink-0 cursor-pointer items-center justify-center size-6 rounded-lg text-gray-500 transition " +
     "hover:bg-gray-50/40 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200";
+  const BELL_SIZE = "1.125rem";   // Open WebUI's header icons (size-4.5)
+  const shown = (e) => !!e && e.getClientRects().length > 0;
+  // Where the bell goes: `box`, before `before` (null: first in it).
+  function bellSpot() {
+    const menuButton = [...document.querySelectorAll("#chat-context-menu-button")].find(shown);
+    const box = menuButton?.closest("nav div.flex-none");
+    if (box) return { box, before: null, menuButton };
+    const tab = menuButton?.closest(".panel-tab");
+    if (tab) return { box: tab, before: [...tab.children].find((c) => c.contains(menuButton)), menuButton };
+    const header = document.querySelector("nav div.flex-none.items-center.self-center");
+    return shown(header) ? { box: header, before: null, menuButton: null } : null;
+  }
   function placeBell() {
     const id = chatIdNow();
-    const menuButton = document.getElementById("chat-context-menu-button");
-    const box = menuButton?.closest("nav div.flex-none") || document.querySelector("nav div.flex-none.items-center.self-center");
+    const spot = bellSpot();
     const old = document.getElementById("oc-push-bell");
-    if (!id || !box || !hasDevices || mutes === null) { old?.remove(); return; }
-    if (old && old.dataset.chat === id && box.firstElementChild === old) return;
+    if (!id || !spot || !hasDevices || mutes === null) { old?.remove(); return; }
+    const placed = spot.before ? old?.nextElementSibling === spot.before : spot.box.firstElementChild === old;
+    if (old && old.dataset.chat === id && old.parentElement === spot.box && placed) return;
     old?.remove();
+    const { box, menuButton } = spot;
+    const size = menuButton?.querySelector("svg")?.getBoundingClientRect().width;
     const b = document.createElement("button");
     b.id = "oc-push-bell";
     b.type = "button";
     b.dataset.chat = id;
     b.className = menuButton?.className || HEADER_BUTTON;
-    b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" style="width:1.125rem;height:1.125rem"></svg>';
+    b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"></svg>';
+    b.firstChild.style.width = b.firstChild.style.height = size ? size + "px" : BELL_SIZE;
     // The chat may have moved to another folder since: read it again first.
     b.onclick = (e) => {
       e.stopPropagation();
       if (closedBy && b.contains(closedBy)) { closedBy = null; return; }   // that press closed it
       loadFolder(id, true).catch(() => {}).then(() => muteMenu(b.getBoundingClientRect(), { chat: id, folder: chatFolder.chat === id ? chatFolder.folder : null }));
     };
-    box.prepend(b);
+    box.insertBefore(b, spot.before || box.firstElementChild);
     drawBell();
   }
 
