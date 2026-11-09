@@ -55,8 +55,11 @@ pipe_build=$(realpath "$3")
 mkdir -p "$run/data" "$run/keys" "$run/pipe" "$run/worker/src"
 cp "$pipe_build" "$run/pipe/openclaw_pipe.py"
 uv run -q --with cryptography python "$here/vapid_keys.py" "$run/keys"
+# On a host with a batch.slice for background work (low CPU weight, memory.high), the throwaway Open WebUI goes there
+# rather than into system.slice beside the services the host protects.
+parent=(); [ -d /sys/fs/cgroup/batch.slice ] && parent=(--cgroup-parent=batch.slice)
 since=$(date +%s)
-docker run -d --name "$name" -p "127.0.0.1:$owui_port:8080" \
+docker run -d --name "$name" "${parent[@]}" -p "127.0.0.1:$owui_port:8080" \
   -e WEBUI_SECRET_KEY=e2e-secret -e ENABLE_SIGNUP=true -e "WEBUI_URL=http://localhost:$worker_port" \
   -v "$run/data:/app/backend/data" -v "$run/keys:/mnt/keys:ro" -v "$run/pipe:/mnt/pipe:ro" \
   "$OWUI_IMAGE" >/dev/null
