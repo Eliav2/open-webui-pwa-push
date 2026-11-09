@@ -953,6 +953,10 @@ def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_pa
     assert [n["url"] for n in page.evaluate(NOTES) if n["tag"] == f"chat-{side}"] == [f"/c/{parent}"]
     tap(page, "", {"chat_id": side, "url": seen["payload"]["url"]})
     page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=parent, timeout=WAIT_MS)
+    # On a phone (under 768 px) Open WebUI's panel is a sheet, closed on each load; its saved tabs come
+    # back with the chat, the side chat the active one: the navbar's Tabs button shows it.
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.get_by_role("button", name="Tabs", exact=True).first.click()
     page.get_by_text("a side question SQ").first.wait_for(timeout=WAIT_MS)   # the side tab, in the parent's panel
     shot(page, "side-chat-tap")
     # A reply that could not be sent waits in the side chat's own box: that one opens the side chat.
