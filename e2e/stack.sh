@@ -61,6 +61,7 @@ parent=(); [ -d /sys/fs/cgroup/batch.slice ] && parent=(--cgroup-parent=batch.sl
 since=$(date +%s)
 docker run -d --name "$name" "${parent[@]}" -p "127.0.0.1:$owui_port:8080" \
   -e WEBUI_SECRET_KEY=e2e-secret -e ENABLE_SIGNUP=true -e "WEBUI_URL=http://localhost:$worker_port" \
+  -e ENABLE_VERSION_UPDATE_CHECK=false \
   -v "$run/data:/app/backend/data" -v "$run/keys:/mnt/keys:ro" -v "$run/pipe:/mnt/pipe:ro" \
   "$OWUI_IMAGE" >/dev/null
 # Ready on the image's own healthcheck turning healthy (docker's event).
