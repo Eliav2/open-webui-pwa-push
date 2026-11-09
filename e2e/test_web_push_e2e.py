@@ -2575,6 +2575,75 @@ def test_a_draft_outlives_a_reload(owui, browser):
     page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
 
 
+# Every WebSocket the page opens (Open WebUI's socket.io among them), so a test can drop the connection.
+KEEP_SOCKETS = """(() => { const W = window.WebSocket; window.ocTestSockets = [];
+  window.WebSocket = function (...a) { const w = new W(...a); window.ocTestSockets.push(w); return w; };
+  window.WebSocket.prototype = W.prototype; Object.assign(window.WebSocket, W); })();"""
+DROP_SOCKETS = "() => window.ocTestSockets.forEach((w) => w.close())"
+
+
+def test_a_draft_outlives_a_socket_reconnect(owui, pw):
+    """A guard, not a fail-first (green on main before and after #8): the connection drops and comes back while a reply is unfinished (a phone's network change
+    while the agent answers), with no page load: Open WebUI joins the chat's room again, asks for
+    its tasks and reads the chat again (Chat.svelte handleSocketConnect). The draft stays in the box."""
+    chat, _ = new_chat(owui, "stub", "Chat Draft Reconnect " + uuid.uuid4().hex[:6])   # its answer: not done
+    text = "a draft before the connection dropped"
+    ctx = chrome(pw)
+    try:
+        ctx.add_init_script(KEEP_SOCKETS)
+        page = signed_in(ctx, owui)
+        warm(page, chat)
+        type_draft(page, chat, text)
+        origin = page.evaluate("() => performance.timeOrigin")
+        with page.expect_response(lambda r: r.url.endswith(f"/api/v1/chats/{chat}") and r.request.method == "GET",
+                                  timeout=WAIT_MS):
+            page.evaluate(DROP_SOCKETS)   # socket.io connects again by itself
+        # Settled: a socket open again (the connect handler ran: its chat read above came after it),
+        # and the page drawn twice since that read's answer.
+        page.wait_for_function("() => window.ocTestSockets.some((w) => w.readyState === WebSocket.OPEN)", timeout=WAIT_MS)
+        page.evaluate("() => new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok)))")
+        assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+        shot(page, "draft-after-reconnect")
+        assert text in page.evaluate(BOX_TEXT), "draft gone: " + json.dumps(page.evaluate(DRAFT_STATE))
+    finally:
+        ctx.close()
+
+
+@needs_chats
+def test_a_draft_outlives_the_reload_into_a_kept_chats_fresh_copy(owui, pw):
+    """The page script's own reload (oc-push.js CHAT_FRESH): the chat was drawn from the copy kept on
+    the device while Open WebUI's socket is down (a phone's network change), and the page reloads
+    into the network's copy once it is in. No reload by the person: the draft must be in the box after it."""
+    tag = uuid.uuid4().hex[:6]
+    chat, answer = new_chat(owui, "stub", "Chat Draft Fresh " + tag)
+    say(owui, chat, answer, "Kept reply " + tag)
+    text = "a draft before the network changed"
+    ctx = chrome(pw)
+    try:
+        page = signed_in(ctx, owui)
+        warm_kept(page, chat)
+        type_draft(page, chat, text)
+        say(owui, chat, answer, "Fresh reply " + tag)
+        ctx.route_web_socket("**/ws/socket.io/**", lambda ws: None)   # connects, the server never speaks
+        gate, undo = slow_network(ctx, owui, chat)
+        try:
+            page.reload()
+            page.get_by_text("Kept reply " + tag).first.wait_for(timeout=WAIT_MS)
+            with page.expect_event("load", timeout=WAIT_MS):   # the page script's reload into the fresh copy
+                gate.set()
+            page.get_by_text("Fresh reply " + tag).first.wait_for(timeout=WAIT_MS)
+        finally:
+            undo()
+        try:
+            page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
+        except Exception:
+            shot(page, "draft-after-fresh-reload")   # an old build: the empty box
+            raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+        shot(page, "draft-after-fresh-reload")
+    finally:
+        ctx.close()
+
+
 def test_a_sent_draft_is_not_put_back(owui, browser):
     """A draft that was sent is gone for good: after the send and a reload, the box is empty."""
     ctx, page = browser
