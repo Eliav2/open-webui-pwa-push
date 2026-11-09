@@ -83,8 +83,14 @@ def main(scenario: str) -> None:
             store.update(valves)
             return valves
 
+    class Chats:
+        @staticmethod
+        async def get_chat_by_id(chat_id):
+            return types.SimpleNamespace(id=chat_id, folder_id=None, chat={})
+
     for name, attrs in (("open_webui", {}), ("open_webui.models", {}),
-                        ("open_webui.models.functions", {"Functions": Functions})):
+                        ("open_webui.models.functions", {"Functions": Functions}),
+                        ("open_webui.models.chats", {"Chats": Chats})):
         sys.modules[name] = types.ModuleType(name)
         sys.modules[name].__dict__.update(attrs)
 

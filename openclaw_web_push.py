@@ -133,17 +133,17 @@ def image_url(value: str) -> str:
 
 
 def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: list | None = None,
-                  swipe_read: bool = True, icon: str = "", badge: str = "") -> dict:
-    """What the device gets: the chat's title and where to open it, the id of
-    this function (the service worker's Mute writes its user valves), and, only
-    with `preview_chars`, the start of the reply. `data.message` holds the whole
-    reply (Open WebUI 0.13.0 and the Pipe); it is never sent whole."""
+                  swipe_read: bool = True, icon: str = "", badge: str = "", open_chat: str = "") -> dict:
+    """What the device gets: the chat's title and where to open it (`open_chat`, a side
+    chat's parent, else the chat itself), the id of this function (the service worker's
+    Mute writes its user valves), and, only with `preview_chars`, the start of the reply.
+    `data.message` holds the whole reply (Open WebUI 0.13.0 and the Pipe); it is never sent whole."""
     data = event.get("data") or {}
     chat_id = str(data.get("chat_id") or "")
     title = str(data.get("title") or event.get("message") or "Reply finished")[:MAX_TITLE_CHARS]
     payload = {"v": 2, "kind": event.get("event"), "source": event.get("source"), "chat_id": chat_id,
                "message_id": data.get("message_id"), "title": title,
-               "url": f"/c/{chat_id}" if chat_id else "/"}
+               "url": f"/c/{open_chat or chat_id}" if chat_id else "/"}
     if fn:
         payload["fn"] = fn
     if not swipe_read:
@@ -350,7 +350,8 @@ class Event:
         if is_muted(valves.get("mutes"), chat_id):
             log.info("web push: chat is muted, nothing sent chat_id=%s", chat_id)
             return
-        folder = await self._muted_folder(valves.get("folder_mutes"), chat_id, user_id)
+        chat = await self._chat(chat_id)
+        folder = await self._muted_folder(valves.get("folder_mutes"), chat, user_id)
         if folder:
             log.info("web push: folder %s is muted, nothing sent chat_id=%s", folder[:8], chat_id)
             return
@@ -368,7 +369,8 @@ class Event:
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
                                             swipe_read=is_on(valves.get("swipe_read"), True),
-                                            icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE))
+                                            icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE,
+                                            open_chat=await self._side_chat_parent(chat, user_id)))
         early = []
         gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject, chat_id, early)
@@ -388,16 +390,39 @@ class Event:
         await asyncio.to_thread(self.send_all, subs, body, topic, key, subject, chat_id)
 
     @staticmethod
-    async def _muted_folder(raw, chat_id: str, user_id: str):
-        """The muted folder that holds the chat, or None. Reads the chat and the
-        user's folders only while a folder mute is in effect."""
-        if not chat_id or not active_mutes(raw):
+    async def _chat(chat_id: str):
+        if not chat_id:
             return None
         from open_webui.models.chats import Chats
+
+        return await Chats.get_chat_by_id(chat_id)
+
+    @staticmethod
+    async def _side_chat_parent(chat, user_id: str) -> str:
+        """The parent of an Open WebUI 0.13 side chat (/btw), or "". A side chat is a chat of its own
+        whose JSON names the parent (`originalChatId`) and which sits as a side tab in the user's saved
+        view of the parent; opening the parent shows it in the panel. A fork or a clone also names
+        an `originalChatId`, but no side tab of its parent holds it, so it opens itself."""
+        parent = str(((chat and chat.chat) or {}).get("originalChatId") or "")
+        if not parent:
+            return ""
+        from open_webui.internal.db import get_async_db
+        from open_webui.models.chat_views import ChatViewStates
+
+        async with get_async_db() as db:
+            view = await ChatViewStates.get(user_id, parent, db) or {}
+        tabs = (view.get("panels") or {}).get("tabs") or []
+        return parent if any(t.get("kind") == "side" and t.get("chatId") == chat.id for t in tabs) else ""
+
+    @staticmethod
+    async def _muted_folder(raw, chat, user_id: str):
+        """The muted folder that holds the chat, or None. Reads the user's
+        folders only while a folder mute is in effect."""
+        if not chat or not active_mutes(raw):
+            return None
         from open_webui.models.folders import Folders
 
-        chat = await Chats.get_chat_by_id(chat_id)
-        if not chat or not chat.folder_id:
+        if not chat.folder_id:
             return None
         parents = {f.id: f.parent_id for f in await Folders.get_folders_by_user_id(user_id)}
         return muted_folder(raw, chat.folder_id, parents)
