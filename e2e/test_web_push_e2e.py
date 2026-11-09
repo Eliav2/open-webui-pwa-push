@@ -2544,7 +2544,9 @@ def test_a_draft_outlives_the_app_being_closed_and_opened_again(owui, pw):
         try:
             page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
         except Exception:
+            shot(page, "draft-after-reopen")   # an old build: the empty box
             raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+        shot(page, "draft-after-reopen")
     finally:
         ctx.close()
 
