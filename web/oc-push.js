@@ -934,6 +934,92 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
+  // A draft outlives closing the app and loading it again. Open WebUI keeps a chat's
+  // draft in sessionStorage, which ends with the tab, and even in the same tab a load
+  // ends with an empty box: its start clears the box, and a delayed save of that empty
+  // box lands after its own restore (Chat.svelte, 0.13.2). So the text the person types
+  // in a chat's box is copied to localStorage, under the user and the chat, as it is
+  // typed (trusted input events only: never Open WebUI's own writes), and put back when
+  // that chat is on screen with an empty box. Until the person types or sends there,
+  // the box being emptied again (that late clear) puts it back again: Open WebUI's next
+  // save then has it. The copy goes when a message is sent from that chat, when the
+  // person empties the box, on a sign-out, and when its chat is gone. Text only: files
+  // added to a draft are not kept. Not named "chat-input…": Open WebUI clears those
+  // keys from localStorage on each load.
+  const DRAFT_COPY = "oc-draft:", LINE = "\n";
+  const COMPLETIONS = "/api/chat/completions", SIGNOUT = "/api/v1/auths/signout";   // oc-sw.js SIGNOUT_PATH
+  const tokenUser = () => {
+    try {
+      return JSON.parse(atob(store.get("token").split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id || "";
+    } catch (_) { return ""; }
+  };
+  const draftKey = (chat) => DRAFT_COPY + tokenUser() + ":" + chat;
+  const dropKey = (k) => { try { localStorage.removeItem(k); } catch (_) {} };
+  const draftKeys = (prefix = DRAFT_COPY) => {
+    try { return Object.keys(localStorage).filter((k) => k.startsWith(prefix)); } catch (_) { return []; }
+  };
+  const messageBox = () => document.getElementById("chat-input");
+  const boxText = (b) => (b.editor ? b.editor.getText({ blockSeparator: LINE }) : b.innerText).trim();
+  const asHtml = (t) => t.replace(/[&<>"]/g, (c) => "&#" + c.charCodeAt(0) + ";");
+  let draftChat = "", draftText = null, touched = false;
+  function draftOnScreen() {
+    const chat = chatIdNow();
+    if (chat === draftChat) return;
+    draftChat = chat;
+    touched = false;
+    draftText = chat && tokenUser() ? store.get(draftKey(chat)) : null;
+  }
+  function putDraftBack() {
+    draftOnScreen();
+    const b = messageBox();
+    if (!draftText || touched || !b?.editor || boxText(b)) return;
+    b.editor.commands.setContent(draftText.split(LINE).map((l) => "<p>" + asHtml(l) + "</p>").join(""), true);
+  }
+  document.addEventListener("input", (e) => {
+    const b = messageBox();
+    if (!e.isTrusted || !b?.contains(e.target) || !tokenUser()) return;
+    draftOnScreen();
+    if (!draftChat) return;
+    touched = true;
+    const text = boxText(b);
+    draftText = text || null;
+    if (text) store.set(draftKey(draftChat), text);
+    else dropKey(draftKey(draftChat));
+  }, true);
+  new MutationObserver(putDraftBack).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+  const draftFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+    if (url.origin === location.origin && url.pathname === SIGNOUT) draftKeys().forEach(dropKey);
+    if (url.origin === location.origin && url.pathname === COMPLETIONS && init?.body) {
+      let chat = "";
+      try { chat = JSON.parse(init.body).chat_id || ""; } catch (_) {}   // not JSON: not a send
+      if (chat) {
+        dropKey(draftKey(chat));
+        if (chat === draftChat) { draftText = null; touched = true; }
+      }
+    }
+    return draftFetch.call(this, input, init);
+  };
+  // Open WebUI answers a chat that is not there with 401 (get_chat_by_id), as it does a
+  // token that is no good: a copy goes only when the token is good (the user's own read
+  // answers) and the network's answer for its chat is that 401. Never offline, and never
+  // on an answer from the service worker's copies (NOT_SAVED_HEADER, KEPT_HEADER).
+  const NO_CHAT = 401;
+  async function dropGoneDrafts() {
+    const own = DRAFT_COPY + tokenUser() + ":";
+    const list = tokenUser() ? draftKeys(own) : [];
+    if (!list.length || !navigator.onLine) return;
+    if (!(await call("/api/v1/auths/", null, OWN_FRESH).catch(() => null))?.id) return;
+    for (const k of list) {
+      const res = await fetch("/api/v1/chats/" + k.slice(own.length), {
+        headers: { Authorization: "Bearer " + store.get("token"), [OWN_READ]: OWN_FRESH },
+      }).catch(() => null);
+      if (res?.status === NO_CHAT && !res.headers.get(NOT_SAVED_HEADER) && !res.headers.get(KEPT_HEADER)) dropKey(k);
+    }
+  }
+  dropGoneDrafts();
+
   window.ocPushEnable = enable;
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
   window.ocPushMuteFolder = (seconds, id = chatFolder.folder) => setMute(FOLDERS, id, seconds);

@@ -367,10 +367,10 @@ def page_trace(request):
             print(sw_diagnostics(page))
 
 
-def chrome(pw):
-    """Google Chrome with its own new profile, as a phone-sized window."""
+def chrome(pw, profile=None):
+    """Google Chrome with its own new profile (or `profile`, to open it again), as a phone-sized window."""
     ctx = pw.chromium.launch_persistent_context(
-        tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
+        profile or tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
         args=["--no-sandbox"], viewport={"width": 390, "height": 844},
         ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
     ctx.set_default_navigation_timeout(WAIT_MS)   # a load waits as long as any other state here
@@ -2211,8 +2211,11 @@ def test_a_sign_out_drops_the_kept_chats(owui, pw):
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         warm_kept(page, chat)
+        type_draft(page, chat, "a draft before the sign-out")
+        assert page.evaluate(DRAFT_COPIES), "the draft has no copy that outlives the tab"
         page.evaluate("() => fetch('/api/v1/auths/signout', {method: 'POST', credentials: 'include'})")
         settled(page, "() => caches.keys().then((ks) => !ks.some((k) => k.startsWith('oc-api-')))")
+        assert page.evaluate(DRAFT_COPIES) == [], "a draft copy stayed after the sign-out"
     finally:
         ctx.close()
 
@@ -2488,3 +2491,164 @@ def test_a_chat_not_saved_here_keeps_its_address_offline_and_opens_once_back(owu
     assert urllib.parse.urlparse(page.url).path == f"/c/{unread}"
     assert page.locator(NOT_SAVED_PILL).count() == 0
 
+
+
+# --- A draft in the message box is never lost: not by the app being closed and opened again
+# (a phone app killed in the background), not by a message posted into the open chat.
+
+BOX_TEXT = "() => document.getElementById('chat-input')?.innerText ?? ''"
+OWUI_DRAFT = "(c) => sessionStorage.getItem('chat-input-' + c) || ''"   # Open WebUI's own draft (Chat.svelte saveDraft)
+DRAFT_STATE = """() => ({box: document.getElementById('chat-input')?.innerText, url: location.pathname,
+  session: Object.fromEntries(Object.keys(sessionStorage).filter((k) => k.startsWith('chat-input')).map((k) => [k, sessionStorage.getItem(k)])),
+  copies: Object.keys(localStorage).filter((k) => k.startsWith('oc-draft:')),
+  user: (() => { try { return JSON.parse(atob(localStorage.token.split('.')[1])).id; } catch (e) { return String(e); } })()})"""
+DRAFT_COPIES = "() => Object.keys(localStorage).filter((k) => k.startsWith('oc-draft:'))"   # oc-push.js DRAFT_COPY
+
+
+def signed_in(ctx, token):
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
+    ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
+    return ctx.pages[0] if ctx.pages else ctx.new_page()
+
+
+def type_draft(page, chat, text):
+    """Typed with the keyboard, then held until Open WebUI has saved it as the chat's draft."""
+    page.locator("#chat-input").click()
+    page.keyboard.type(text)
+    page.wait_for_function(f"(c) => ({OWUI_DRAFT})(c).includes({json.dumps(text)})", arg=chat, timeout=WAIT_MS)
+
+
+@needs_offline
+def test_a_draft_outlives_the_app_being_closed_and_opened_again(owui, pw):
+    """A draft typed in a chat is still in the box after the app is closed and opened again on
+    the same device (a phone app killed in the background): Open WebUI keeps drafts only for the
+    life of the tab (sessionStorage)."""
+    chat, _ = new_chat(owui, "stub", "Chat Draft Cold " + uuid.uuid4().hex[:6])
+    text = "a draft typed before the app closed"
+    profile = tempfile.mkdtemp(prefix="webpush-e2e-")
+    ctx = chrome(pw, profile)
+    try:
+        page = signed_in(ctx, owui)
+        warm(page, chat)
+        type_draft(page, chat, text)
+        assert page.evaluate(DRAFT_COPIES), "the draft has no copy that outlives the tab"
+    finally:
+        ctx.close()
+    ctx = chrome(pw, profile)
+    try:
+        page = signed_in(ctx, owui)
+        page.goto(f"{BASE}/c/{chat}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        page.get_by_text("hi", exact=True).first.wait_for(timeout=WAIT_MS)
+        try:
+            page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
+        except Exception:
+            raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+    finally:
+        ctx.close()
+
+
+def test_a_draft_outlives_a_reload(owui, browser):
+    """A draft typed in a chat is still in the box after the page is loaded again in the same
+    tab. Open WebUI 0.13.2 alone loses it: its load clears the box, and a delayed save of that
+    empty box lands after its own restore (checked on Open WebUI's own port, no add-on)."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Draft Reload " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    text = "a draft before a reload"
+    type_draft(page, chat, text)
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.get_by_text("hi", exact=True).first.wait_for(timeout=WAIT_MS)
+    try:
+        page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
+    except Exception:
+        raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+    # Open WebUI's own delayed save comes after: the draft must still be there once it has
+    # saved, and be what Open WebUI keeps as the chat's draft.
+    page.wait_for_function(f"(c) => ({OWUI_DRAFT})(c).includes({json.dumps(text)})", arg=chat, timeout=WAIT_MS)
+    assert text in page.evaluate(BOX_TEXT)
+    page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
+
+
+def test_a_sent_draft_is_not_put_back(owui, browser):
+    """A draft that was sent is gone for good: after the send and a reload, the box is empty."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Draft Sent " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    type_draft(page, chat, "a draft that is sent")
+    page.keyboard.press("Enter")
+    page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
+    assert page.evaluate(DRAFT_COPIES) == [], "the sent draft still has a copy"
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
+    assert page.evaluate(BOX_TEXT).strip() == ""
+
+
+def post_like_owui_send(token, chat, text, model):
+    """The manager's owui_send (projects/session-manager/owui_send.py _send_locked), step by step:
+    a user message and an assistant stub written into the chat, chat:reload to the open tab, then
+    the completion request for the stub (read to its end)."""
+    c = api(f"/api/v1/chats/{chat}", token=token)["chat"]
+    h, leaf = c["history"], c["history"]["currentId"]
+    uid, aid, now = str(uuid.uuid4()), str(uuid.uuid4()), int(time.time())
+    umsg = {"id": uid, "parentId": leaf, "childrenIds": [aid], "role": "user", "content": text,
+            "timestamp": now, "models": [model]}
+    amsg = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant", "content": "",
+            "timestamp": now, "done": False, "model": model, "modelName": model, "modelIdx": 0}
+    h["messages"][leaf].setdefault("childrenIds", []).append(uid)
+    h["messages"][uid], h["messages"][aid], h["currentId"] = umsg, amsg, aid
+    c.setdefault("messages", []).extend([umsg, amsg])
+    api(f"/api/v1/chats/{chat}", {"chat": c}, token)
+    api(f"/api/v1/chats/{chat}/messages/{aid}/event", {"type": "chat:reload", "data": {}}, token)
+    req = urllib.request.Request(OWUI + "/api/chat/completions", method="POST", data=json.dumps(
+        {"model": model, "messages": [{"role": "user", "content": text}], "stream": True, "chat_id": chat,
+         "id": aid, "assistant_message_id": aid, "user_message": umsg, "session_id": "e2e-send"}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        r.read()
+    return aid
+
+
+def test_a_draft_outlives_a_message_posted_into_the_open_chat(owui, browser):
+    """Typing in a chat while another sender posts into it the way owui_send does (the message,
+    chat:reload, the reply): the posted message and its reply show, and the draft stays in the box."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Draft Post " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    text = "a draft typed while a message came in"
+    type_draft(page, chat, text)
+    aid = post_like_owui_send(owui, chat, "posted from outside", "stub")
+    page.get_by_text("posted from outside").first.wait_for(timeout=WAIT_MS)
+    end = time.time() + WAIT_MS / 1000
+    while not history(owui, chat)["messages"][aid].get("done"):
+        assert time.time() < end, "the posted message's reply never finished"
+        time.sleep(STATE_POLL_S)
+    page.locator("#send-message-button").wait_for(timeout=WAIT_MS)   # the page has the reply's end: Send, not Stop
+    assert text in page.evaluate(BOX_TEXT), f"draft gone: {page.evaluate(BOX_TEXT)!r}"
+    page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
+
+
+def test_a_draft_copy_goes_once_its_chat_is_deleted_elsewhere(owui, browser):
+    """Drafts in two chats; one chat is deleted elsewhere (another device: the API). The next
+    load drops that chat's copy and keeps the other's."""
+    ctx, page = browser
+    page.bring_to_front()
+    gone, _ = new_chat(owui, "stub", "Chat Draft Gone " + uuid.uuid4().hex[:6])
+    kept, _ = new_chat(owui, "stub", "Chat Draft Kept " + uuid.uuid4().hex[:6])
+    warm(page, gone)
+    type_draft(page, gone, "a draft in a chat about to be deleted")
+    warm(page, kept)
+    type_draft(page, kept, "a draft in a chat that stays")
+    copy_of = "(c) => Object.keys(localStorage).some((k) => k.startsWith('oc-draft:') && k.endsWith(':' + c))"
+    assert page.evaluate(copy_of, gone) and page.evaluate(copy_of, kept)
+    api(f"/api/v1/chats/{gone}", token=owui, method="DELETE")
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.wait_for_function(f"(c) => !({copy_of})(c)", arg=gone, timeout=WAIT_MS)
+    assert page.evaluate(copy_of, kept), "the copy of a chat that still exists was dropped"
+    page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
