@@ -39,6 +39,9 @@ SUBJECT_SCHEMES = ("mailto:", "https://")
 LOCAL_HOST = "localhost"
 LOCAL_HOST_SUFFIXES = (".localhost", ".local")
 LABEL_DOT = "."   # a bare name (no dot) is no public host
+# Open WebUI 0.13's chat_view_state contract (models/chat_views.py PanelTab.kind): a side chat
+# (/btw) sits in its parent's saved view as a tab of this kind, naming the side chat in chatId.
+SIDE_TAB_KIND = "side"
 # Written into the user's own valves (push_problem) when nothing can be sent; the page shows it.
 NO_SUBJECT = ("Notifications can't be sent yet: the admin must set VAPID_SUBJECT in the Web Push "
               "function's valves (a mailto: address or an https: URL on a public host), since WEBUI_URL is not one.")
@@ -412,7 +415,7 @@ class Event:
         async with get_async_db() as db:
             view = await ChatViewStates.get(user_id, parent, db) or {}
         tabs = (view.get("panels") or {}).get("tabs") or []
-        return parent if any(t.get("kind") == "side" and t.get("chatId") == chat.id for t in tabs) else ""
+        return parent if any(t.get("kind") == SIDE_TAB_KIND and t.get("chatId") == chat.id for t in tabs) else ""
 
     @staticmethod
     async def _muted_folder(raw, chat, user_id: str):
