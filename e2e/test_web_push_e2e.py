@@ -954,10 +954,13 @@ def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_pa
     tap(page, "", {"chat_id": side, "url": seen["payload"]["url"]})
     page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=parent, timeout=WAIT_MS)
     # On a phone (under 768 px) Open WebUI's panel is a sheet, closed on each load; its saved tabs come
-    # back with the chat, the side chat the active one: the navbar's Tabs button shows it.
+    # back with the chat, the side chat the active one: the navbar's Tabs button shows it. The sheet
+    # shows the side chat's answer (its question counts as context there), not the parent's empty one.
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
     page.get_by_role("button", name="Tabs", exact=True).first.click()
-    page.get_by_text("a side question SQ").first.wait_for(timeout=WAIT_MS)   # the side tab, in the parent's panel
+    sheet = page.get_by_role("dialog")
+    sheet.get_by_role("tab", name="Side SQ", selected=True).wait_for(timeout=WAIT_MS)
+    sheet.get_by_text(SECRETS[0]).first.wait_for(timeout=WAIT_MS)
     shot(page, "side-chat-tap")
     # A reply that could not be sent waits in the side chat's own box: that one opens the side chat.
     assert act(page, "reply", {"chat_id": side, "url": f"/c/{parent}", "fn": "web_push"}, "") == "compose"
