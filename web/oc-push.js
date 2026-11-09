@@ -119,11 +119,13 @@
   const pill = "position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;gap:4px;" +
     "font:14px system-ui,sans-serif;background:#111;color:#fff;border-radius:999px;padding:4px;box-shadow:0 2px 8px #0004";
 
+  // Not while offline: it would sit where the offline pill is (below); it comes back online.
+  const OFFER = "oc-push-offer", NO_PERMISSION = "no-permission";   // ensure()'s state for it
   function offer() {
-    if (Notification.permission !== "default" || store.get("ocPushOffer") === "dismissed" || !store.get("token") ||
-      document.getElementById("oc-push-offer")) return;
+    if (!navigator.onLine || Notification.permission !== "default" || store.get("ocPushOffer") === "dismissed" || !store.get("token") ||
+      document.getElementById(OFFER)) return;
     const bar = document.createElement("div");
-    bar.id = "oc-push-offer";
+    bar.id = OFFER;
     bar.setAttribute("role", "region");
     bar.setAttribute("aria-label", "Notifications");
     bar.style.cssText = pill;
@@ -175,7 +177,7 @@
   // A chat on screen from the copy the worker kept of it (oc-sw.js, kept chats)
   // gets the same lock and an "Updating…" pill until Open WebUI has the network's
   // copy: a message sent on an old copy could branch off an old point of the chat.
-  const OFFLINE_PILL = "oc-offline", UPDATING_PILL = "oc-updating";
+  const OFFLINE_PILL = "oc-offline", UPDATING_PILL = "oc-updating", NOT_SAVED_PILL = "oc-not-saved";
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const LOCKED = "ocOfflineLocked";   // data-oc-offline-locked on the locked composer
   const LOCKED_OPACITY = "0.5";
@@ -194,6 +196,15 @@
     f.dataset[LOCKED] = "1";
   }
   let offline = false;
+  // A chat opened offline that the worker has no copy of: it answers Open WebUI's read
+  // with an error marked NOT_SAVED_HEADER, and Open WebUI takes its "chat not found" path
+  // (it goes to "/"). That navigation, right after the marked read, is put back on the
+  // chat's address, and the chat is parked there: a pill says why it is empty, and the
+  // page reloads into the chat when the network is back. Leaving the chat unparks it.
+  const NOT_SAVED_HEADER = "x-oc-not-saved";   // oc-sw.js
+  const HOME = "/";
+  let notSaved = "";   // the chat whose read was just answered so, its "not found" not yet seen
+  let parked = "";
   const keptChats = new Set();   // chats whose kept copy Open WebUI has, not yet the network's
   const updating = () => keptChats.has(chatIdNow());
   // Open WebUI draws a new message box on each chat, and its first render can
@@ -201,6 +212,8 @@
   const relock = new MutationObserver(() => { lockComposer(true); showPills(); });
   async function offlinePill() {
     offline = !navigator.onLine && await caches.has(KEPT_APP).catch(() => false) && !navigator.onLine;
+    if (!navigator.onLine) document.getElementById(OFFER)?.remove();
+    else if (window.ocPushState === NO_PERMISSION) offer();
     readOnly();
   }
   let unlocked = [];   // waiting for the message box to take text
@@ -217,7 +230,9 @@
     showPills();
   }
   function showPills() {
-    statusPill(OFFLINE_PILL, offline, "Offline: saved chats, read-only");
+    const notHere = !!parked && parked === chatIdNow();
+    statusPill(NOT_SAVED_PILL, notHere, "This chat isn't saved on this device. It opens when you're back online.");
+    statusPill(OFFLINE_PILL, offline && !notHere, "Offline: saved chats, read-only");
     statusPill(UPDATING_PILL, !offline && updating(), "Updating…");
   }
   function statusPill(id, on, text) {
@@ -232,6 +247,7 @@
     document.body.appendChild(p);
   }
   addEventListener("online", offlinePill);
+  addEventListener("online", () => { if (parked && parked === chatIdNow()) location.reload(); });
   addEventListener("offline", offlinePill);
   offlinePill();
 
@@ -276,6 +292,7 @@
     reading.set(id, (reading.get(id) || 0) + 1);
     const done = () => reading.set(id, reading.get(id) - 1);
     return pageFetch.call(this, input, init).finally(done).then((res) => {
+      if (res.headers.has(NOT_SAVED_HEADER) && id === chatIdNow() && !navigator.onLine) notSaved = id;
       if (res.headers.has(KEPT_HEADER)) {
         keptChats.add(id);
         if (!open) refreshedKept.add(id);
@@ -685,7 +702,17 @@
   // the token, then navigates on the client (SvelteKit calls history.pushState
   // or replaceState). Each navigation checks whether the token changed since the
   // last run, and runs again if so.
+  const replaceState = history.replaceState;
+  function stayOnChat() {
+    const id = notSaved;
+    notSaved = "";
+    if (id && location.pathname === HOME) {
+      replaceState.call(history, history.state, "", "/c/" + id);
+      parked = id;
+    } else if (parked !== chatIdNow()) parked = "";
+  }
   const navigated = () => {
+    stayOnChat();
     wentTo();
     readOnly();
     const t = store.get("token");

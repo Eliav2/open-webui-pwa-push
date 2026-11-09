@@ -2377,3 +2377,114 @@ def test_the_kill_switch_drops_the_caches_and_stops_serving(owui, pw):
     finally:
         ctx.close()
         worker_offline("1")
+
+
+# --- Offline open, every case gets the app's own screen: no page kept to open, the
+# notifications offer offline, a chat with no copy on this device.
+
+OFFLINE_PAGE = "#oc-offline-page"   # oc-sw.js offlinePage()
+OFFER = "#oc-push-offer"
+NOT_SAVED_PILL = "#oc-not-saved"
+PAGE_KEPT = "() => caches.open('oc-shell-v1').then((c) => c.match('/')).then((r) => !!r)"
+NOTHING_LOADED = "() => performance.getEntriesByType('resource').length === 0"
+
+
+def own_chrome(pw, token):
+    """chrome() signed in as `token`, with no notification permission asked yet."""
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(token)})")
+    return ctx, (ctx.pages[0] if ctx.pages else ctx.new_page())
+
+
+@needs_offline
+def test_with_no_page_kept_and_no_network_the_app_shows_its_own_offline_page(owui, pw):
+    """No page kept to open (dropped: a new Open WebUI, an expired sign-in) and no network: the
+    worker's own page with Open WebUI's name and icon, kept with the page, and nothing loaded.
+    Never the browser's offline page. The network back: it opens the app by itself."""
+    chat, _ = new_chat(owui, "stub", "Chat Offline Page")
+    with urllib.request.urlopen(BASE + "/manifest.json", timeout=30) as r:
+        name = json.loads(r.read())["name"]
+    ctx, page = own_chrome(pw, owui)
+    try:
+        warm(page, chat)
+        settled(page, PAGE_KEPT)
+        page.evaluate("() => caches.open('oc-shell-v1').then((c) => c.delete('/'))")
+        ctx.set_offline(True)
+        try:
+            page.reload(timeout=WAIT_MS)
+            page.locator(OFFLINE_PAGE).wait_for(timeout=WAIT_MS)
+            shot(page, "offline-page")
+            assert page.locator("h1").inner_text() == name
+            assert page.locator("img").get_attribute("src").startswith("data:image/")
+            assert page.evaluate(NOTHING_LOADED), page.evaluate("() => performance.getEntriesByType('resource').map((r) => r.name)")
+        finally:
+            ctx.set_offline(False)
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        assert urllib.parse.urlparse(page.url).path == f"/c/{chat}"
+    finally:
+        ctx.close()
+
+
+@needs_offline
+def test_offline_the_notifications_offer_steps_aside_for_the_pill(owui, pw):
+    """The "Enable notifications" offer sits where the offline pill is: offline it goes (the
+    network going, or opened offline), and it comes back with the network."""
+    chat, _ = new_chat(owui, "stub", "Chat Offer Offline")
+    ctx, page = own_chrome(pw, owui)
+    offer, pill = page.locator(OFFER), page.locator("#oc-offline")
+    try:
+        warm(page, chat)
+        assert ready(page) == "no-permission"
+        offer.wait_for(timeout=WAIT_MS)
+        ctx.set_offline(True)
+        try:
+            pill.wait_for(timeout=WAIT_MS)
+            offer.wait_for(state="detached", timeout=WAIT_MS)
+            page.reload(timeout=WAIT_MS)
+            pill.wait_for(timeout=WAIT_MS)
+            assert ready(page) == "no-permission"
+            shot(page, "offline-offer")
+            assert offer.count() == 0, "the offer covers the offline pill"
+        finally:
+            ctx.set_offline(False)
+        offer.wait_for(timeout=WAIT_MS)
+        pill.wait_for(state="detached", timeout=WAIT_MS)
+    finally:
+        ctx.close()
+
+
+@needs_offline
+def test_a_chat_not_saved_here_keeps_its_address_offline_and_opens_once_back(owui, browser):
+    """Offline, the sidebar lists the chats; one never opened on this device has no copy here.
+    Open WebUI takes its "chat not found" path (to "/"): the page stays on the chat's address with
+    a pill saying why, and opens the chat once the network is back."""
+    ctx, page = browser
+    page.bring_to_front()
+    unread, msg = new_chat(owui, "stub", "Chat Not Saved " + uuid.uuid4().hex[:6])
+    reply(owui, "stub", unread, msg)
+    wait_done(owui, unread, msg)
+    text = [m for m in history(owui, unread)["messages"].values() if m["role"] == "assistant"][0]["content"]
+    text = text.strip().splitlines()[0][:30]
+    read, _ = new_chat(owui, "stub", "Chat Saved Here")
+    warm(page, read)   # the sidebar's list, read after both chats were made, is kept
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)
+        link = sidebar_link(page, unread)
+        link.wait_for(timeout=WAIT_MS)
+        shot(page, "offline-sidebar")
+        link.click()
+        try:
+            page.locator(NOT_SAVED_PILL).wait_for(timeout=WAIT_MS)
+        finally:
+            print("address after the open:", page.url)
+        page.wait_for_timeout(MENU_DRAWN_WAIT_MS)   # SvelteKit's own history writes after the navigation
+        shot(page, "offline-not-saved")
+        assert urllib.parse.urlparse(page.url).path == f"/c/{unread}"
+        assert page.locator("#oc-offline").count() == 0, "two pills in one place"
+    finally:
+        ctx.set_offline(False)
+    page.get_by_text(text, exact=False).first.wait_for(timeout=WAIT_MS)
+    assert urllib.parse.urlparse(page.url).path == f"/c/{unread}"
+    assert page.locator(NOT_SAVED_PILL).count() == 0
+
