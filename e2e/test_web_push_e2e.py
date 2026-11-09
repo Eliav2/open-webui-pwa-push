@@ -1809,9 +1809,13 @@ def test_a_newer_open_webui_never_runs_the_kept_app(owui, browser):
     settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(real)})")
 
 
-# Shorter than the 4.2 s lie-fi wait of the worker before this change (so that one waited for
-# the answer), long enough to see the app drawn without it.
-SLOW_VERSION_DELAY_S = 3
+def sw_const(name):
+    return int(re.search(rf"^const {name} = (\d+);$", open(os.path.join(ROOT, "web", "oc-sw.js")).read(), re.M).group(1))
+
+
+# How long the worker before ELI-352 waited for the network before it gave the kept app (oc-sw.js LIE_FI_MS).
+LIE_FI_MS = sw_const("SLOW_3G_SLOWEST_MS") * sw_const("SILENT_FACTOR")
+NAV_ANSWER_MS = "() => { const n = performance.getEntriesByType('navigation')[0]; return n.responseStart - n.fetchStart; }"
 
 
 @needs_offline
@@ -1823,11 +1827,12 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
     chat, _ = new_chat(owui, "stub", "Chat Instant")
     warm(page, chat)
     real = urllib.request.urlopen(OWUI + "/api/version", timeout=30).read()
-    answered = threading.Event()
+    # The network answers only once the app is drawn: the app can never be waiting on it. Whether the
+    # worker waited is its answer's time to the page, not the drawing's (that one grows with the host's load).
+    drawn = threading.Event()
     class SlowVersion(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            time.sleep(SLOW_VERSION_DELAY_S)   # a slow network's answer
-            answered.set()
+            drawn.wait(WAIT_MS / 1000)
             body, kind = (real, "application/json") if self.path == "/api/version" else (page_html, "text/html")
             self.send_response(200)
             self.send_header("Content-Type", kind)
@@ -1849,11 +1854,12 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
     try:
         page.reload(wait_until="commit")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        assert not answered.is_set(), "the app waited for the network"
+        waited = page.evaluate(NAV_ANSWER_MS)
+        assert waited < LIE_FI_MS, f"the worker waited {waited:.0f} ms for the network"
     finally:
+        drawn.set()
         ctx.unroute("**/api/version", slow)
         ctx.unroute(f"**/c/{chat}", slow)
-        answered.wait(WAIT_MS / 1000)
         srv.shutdown()
 
 
