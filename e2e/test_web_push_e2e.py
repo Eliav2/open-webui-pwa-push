@@ -2598,7 +2598,10 @@ def test_a_draft_outlives_a_socket_reconnect(owui, pw):
         with page.expect_response(lambda r: r.url.endswith(f"/api/v1/chats/{chat}") and r.request.method == "GET",
                                   timeout=WAIT_MS):
             page.evaluate(DROP_SOCKETS)   # socket.io connects again by itself
-        page.wait_for_load_state("networkidle", timeout=WAIT_MS)   # the reconnect's reads all answered
+        # Settled: a socket open again (the connect handler ran: its chat read above came after it),
+        # and the page drawn twice since that read's answer.
+        page.wait_for_function("() => window.ocTestSockets.some((w) => w.readyState === WebSocket.OPEN)", timeout=WAIT_MS)
+        page.evaluate("() => new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok)))")
         assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
         shot(page, "draft-after-reconnect")
         assert text in page.evaluate(BOX_TEXT), "draft gone: " + json.dumps(page.evaluate(DRAFT_STATE))
