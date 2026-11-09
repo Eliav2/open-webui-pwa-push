@@ -975,16 +975,22 @@
     if (!draftText || touched || !b?.editor || boxText(b)) return;
     b.editor.commands.setContent(draftText.split(LINE).map((l) => "<p>" + asHtml(l) + "</p>").join(""), true);
   }
-  document.addEventListener("input", (e) => {
+  function copyTyped() {
     const b = messageBox();
-    if (!e.isTrusted || !b?.contains(e.target) || !tokenUser()) return;
-    draftOnScreen();
-    if (!draftChat) return;
-    touched = true;
+    if (!b || !draftChat) return;
     const text = boxText(b);
     draftText = text || null;
     if (text) store.set(draftKey(draftChat), text);
     else dropKey(draftKey(draftChat));
+  }
+  document.addEventListener("input", (e) => {
+    if (!e.isTrusted || !messageBox()?.contains(e.target) || !tokenUser()) return;
+    draftOnScreen();
+    if (!draftChat) return;
+    touched = true;
+    // The editor takes the keystroke into its text from the DOM change, after this
+    // event: read the box once it has.
+    queueMicrotask(copyTyped);
   }, true);
   new MutationObserver(putDraftBack).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   const draftFetch = window.fetch;

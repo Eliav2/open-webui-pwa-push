@@ -2581,7 +2581,8 @@ def test_a_sent_draft_is_not_put_back(owui, browser):
     type_draft(page, chat, "a draft that is sent")
     page.keyboard.press("Enter")
     page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
-    assert page.evaluate(DRAFT_COPIES) == [], "the sent draft still has a copy"
+    # Open WebUI draws the message, then sends it: the copy goes with the send.
+    page.wait_for_function(f"() => ({DRAFT_COPIES})().length === 0", timeout=WAIT_MS)
     page.reload()
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
     page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
