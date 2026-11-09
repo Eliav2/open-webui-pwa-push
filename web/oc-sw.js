@@ -400,7 +400,13 @@ const OFFLINE_SETTING = "__OC_OFFLINE__", ON = "1";
 const OFFLINE = OFFLINE_SETTING === ON;
 const SHELL = "oc-shell-v1";          // the app: its page, its hashed files, /static
 const API_PREFIX = "oc-api-";         // + a hash of the user's token: one user's reads
-const OURS = (name) => name === SHELL || name.startsWith(API_PREFIX);
+// The device's own offline page, for a launch with no network and no kept app to open (none
+// kept yet, or dropped): Open WebUI's name and icon, read when a page is kept, and nothing
+// else. It loads nothing and holds no user data; it outlives a new Open WebUI version.
+const OFFLINE_ID = "oc-offline-v1";
+const OFFLINE_ID_KEY = "/_oc/offline";
+const DEFAULT_NAME = "Open WebUI";
+const OURS = (name) => name === SHELL || name === OFFLINE_ID || name.startsWith(API_PREFIX);
 // How long a request waits for a network that does not answer at all (lie-fi)
 // before the kept copy is used. Not a speed setting: it never fires on a network
 // that answers at Slow 3G speed. Measured 2026-11-05 on DevTools' Slow 3G (2 s
@@ -443,7 +449,7 @@ const IMAGES = [/^\/api\/v1\/models\/model\/profile\/image$/, /^\/api\/v1\/users
 const NEW_VERSION = "oc-new-version";   // to the page: reload, the app it runs is not this server's
 const HTTP_OK = 200, HTTP_SERVER_ERROR = 500;
 const HASH_HEX = 16, HEX = 16, BYTE_DIGITS = 2;
-const SAME_ORIGIN = "basic", GET = "GET", NAVIGATE = "navigate", NO_STORE = "no-store", MANUAL = "manual";
+const SAME_ORIGIN = "basic", ERROR = "error", GET = "GET", NAVIGATE = "navigate", NO_STORE = "no-store", MANUAL = "manual";
 const OPAQUE_REDIRECT = "opaqueredirect";
 const never = new Promise(() => {});
 const after = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -550,7 +556,7 @@ async function navigate(e, req) {
   const kept = await (await cache.match(VERSION_KEY))?.text();
   const other = (v) => v !== null && v !== kept;
   const version = asked.then(async (v) => {
-    if (other(v)) await dropCaches(() => true);
+    if (other(v)) await dropCaches((n) => n !== OFFLINE_ID);
     // A login instead of a version: the kept page is not opened again.
     else if (redirected) await cache.delete(PAGE_KEY);
     return v;
@@ -560,7 +566,7 @@ async function navigate(e, req) {
   bootVersion.set(e.resultingClientId, asked);
   // A copy taken as the answer comes, before the page reads its body.
   e.waitUntil(keepPage(net.then((res) => res && res.clone()), version));
-  if (!saved) return (await net) || Response.error();
+  if (!saved) return (await net) || offlinePage();
   if (kept !== undefined) {
     // The kept app is that version, so its own /api/version read gets that at once:
     // Open WebUI waits for it while it starts, and the server's answer is only for
@@ -581,7 +587,7 @@ async function navigate(e, req) {
     after(LIE_FI_MS).then(() => ({ silent: true })),
   ]);
   if (first.res) return first.res;
-  if (first.v !== undefined && first.v !== kept) return (await net) || Response.error();
+  if (first.v !== undefined && first.v !== kept) return (await net) || offlinePage();
   if (first.silent) {
     // Nothing heard: the page's /api/version goes the usual way (the kept copy, as any read).
     bootVersion.delete(e.resultingClientId);
@@ -596,11 +602,61 @@ async function navigate(e, req) {
 async function keepPage(net, version) {
   const [res, v] = await Promise.all([net, version]);
   if (!keepable(res) || !(await isAppPage(res.clone()))) return;
+  await keepIdentity();   // before the page: a kept page always has the offline page's name and icon
   const cache = await caches.open(SHELL);
   await cache.put(PAGE_KEY, res.clone());
   if (v === null) await cache.delete(VERSION_KEY);
   else await cache.put(VERSION_KEY, new Response(v));
   await pruneShell(res.clone(), cache);
+  await keepHeadFiles(await res.clone().text(), cache);
+}
+
+// The files the page's own tags load (its <script src>, <link href>: Open WebUI's
+// /static/loader.js, which this add-on's page script comes in, custom.css, the
+// manifest), kept with it. On a fresh device the first page kept can come before
+// those files are (seen in Chrome): opened offline then, the app had no page script,
+// so no offline pill and no locked message box.
+const HEAD_FILE = /<(?:script|link)\b[^>]*?\b(?:src|href)=["'](\/(?:static\/|manifest\.json)[^"'?#]*)["']/g;
+async function keepHeadFiles(html, cache) {
+  for (const [, path] of html.matchAll(HEAD_FILE)) {
+    if (await cache.match(path)) continue;
+    const res = await again(path, { credentials: "same-origin" }).catch(() => null);
+    if (keepable(res)) await cache.put(path, res);
+  }
+}
+
+// The name and icon the offline page shows, read once (online, a page just kept).
+async function keepIdentity() {
+  const kept = await caches.open(OFFLINE_ID);
+  if (await kept.match(OFFLINE_ID_KEY)) return;
+  let name = DEFAULT_NAME;
+  try { name = (await (await fetch(MANIFEST)).json()).name || name; } catch (_) {}
+  await kept.put(OFFLINE_ID_KEY, Response.json({ name, icon: (await ownIcon()) || "" }));
+}
+
+// The page itself: built here from what was kept, nothing to load. It reloads when the
+// browser says the network is back (its "online" event), or on "Try again".
+const OFFLINE_PAGE_TEXT = "Offline: waiting for the network";
+const DATA_IMAGE = /^data:image\/[\w.+-]+;base64,[\w+/=]+$/;
+const ICON_PX = 96;
+const NO_ICON = "data:,";   // the page's icon when none was kept: the browser asks for /favicon.ico otherwise
+async function offlinePage() {
+  const id = await (await (await caches.open(OFFLINE_ID)).match(OFFLINE_ID_KEY))?.json().catch(() => null) || {};
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  const name = esc(id.name || DEFAULT_NAME);
+  const src = DATA_IMAGE.test(id.icon || "") ? id.icon : "";
+  const icon = src ? `<img src="${src}" alt="" width="${ICON_PX}" height="${ICON_PX}">` : "";
+  return new Response(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${name}</title>
+<link rel="icon" href="${src || NO_ICON}">
+<style>:root{color-scheme:light dark}body{margin:0;min-height:100dvh;display:flex;flex-direction:column;align-items:center;
+justify-content:center;gap:14px;font:16px system-ui,sans-serif;background:#fff;color:#111}
+@media (prefers-color-scheme:dark){body{background:#171717;color:#eee}}img{border-radius:20px}h1{font-size:22px;margin:0}
+p{margin:0;opacity:.7}button{font:inherit;padding:8px 18px;border-radius:999px;border:1px solid #8886;background:none;color:inherit}</style>
+</head><body id="oc-offline-page">${icon}<h1>${name}</h1><p role="status">${OFFLINE_PAGE_TEXT}</p>
+<button type="button" onclick="location.reload()">Try again</button>
+<script>addEventListener("online", () => location.reload());</script></body></html>`,
+  { headers: { "content-type": "text/html; charset=utf-8", "cache-control": NO_STORE } });
 }
 
 // A new page means a new Open WebUI build: its hashed files are new too, so the
@@ -814,6 +870,14 @@ function fetchChat(e, req, cache, key, session) {
 //   fetched behind the open if it came first (no second download);
 // - the page script's own (OWN_READ): the kept copy if there is one, or the network's
 //   with OWN_FRESH (the chat's folder before a mute); it changes nothing.
+// A chat read with no network (or the server down) and no copy kept here: an error Open
+// WebUI handles as before (it goes home), marked so that the page script knows why.
+const NOT_SAVED_HEADER = "x-oc-not-saved";   // oc-push.js
+const HTTP_UNAVAILABLE = 503;
+const notSaved = (res) => new Response(JSON.stringify({ detail: "This chat is not saved on this device" }), {
+  status: res?.status || HTTP_UNAVAILABLE, headers: { "content-type": "application/json", [NOT_SAVED_HEADER]: ON },
+});
+
 async function chatRead(e, req, name, session) {
   if (session !== signOuts) return again(req);
   const cache = await caches.open(name);
@@ -830,7 +894,7 @@ async function chatRead(e, req, name, session) {
     if (!own) f.joined = true;
     const late = saved && !kept ? after(LIE_FI_MS).then(() => saved) : never;
     const res = await Promise.race([f.res.then((r) => r?.clone()), late]);
-    return down(res) ? saved || res || Response.error() : res;
+    return down(res) ? saved || notSaved(res) : res;
   };
   if (own) return own !== OWN_FRESH && saved ? saved : waited(fetchChat(e, req, cache, key, session));
   if (req.headers.has(OPEN_READ)) {
@@ -902,9 +966,11 @@ self.addEventListener("fetch", (e) => {
       e.respondWith(apiCacheFor(auth).then((name) => chatRead(e, req, name, session)));
       return;
     }
+    // A chat with no copy here and no network: marked as such (chatRead's notSaved).
+    const chat = CHAT_READ.test(path) && !url.search;
     const read = (name, onFresh) => (fresh
       ? freshFirst(e, req, name, req.url, LIE_FI_MS, onFresh)
-      : savedFirst(e, req, name, req.url, onFresh));
+      : savedFirst(e, req, name, req.url, onFresh)).then((res) => (chat && res.type === ERROR ? notSaved() : res));
     // Public reads (/api/config, /api/version) go with the app; a user's in their own
     // cache, unless they signed out meanwhile.
     const session = signOuts;
