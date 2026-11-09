@@ -2575,6 +2575,46 @@ def test_a_draft_outlives_a_reload(owui, browser):
     page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
 
 
+# Every WebSocket the page opens (Open WebUI's socket.io among them), so a test can drop the connection.
+KEEP_SOCKETS = """(() => { const W = window.WebSocket; window.ocTestSockets = [];
+  window.WebSocket = function (...a) { const w = new W(...a); window.ocTestSockets.push(w); return w; };
+  window.WebSocket.prototype = W.prototype; Object.assign(window.WebSocket, W); })();"""
+DROP_SOCKETS = "() => window.ocTestSockets.forEach((w) => w.close())"
+
+
+def test_a_draft_outlives_a_socket_reconnect(owui, pw):
+    """The connection drops and comes back while a reply is still unfinished (a phone's network
+    change while the agent answers): Open WebUI 0.13 loads the chat again on the reconnect
+    (Chat.svelte handleSocketConnect: no task left and a pending assistant leaf -> loadChat), with no
+    page load. That load draws a new, empty message box, as a reload does; the draft must be back."""
+    chat, _ = new_chat(owui, "stub", "Chat Draft Reconnect " + uuid.uuid4().hex[:6])   # its answer: not done
+    text = "a draft before the connection dropped"
+    ctx = chrome(pw)
+    try:
+        ctx.add_init_script(KEEP_SOCKETS)
+        page = signed_in(ctx, owui)
+        warm(page, chat)
+        type_draft(page, chat, text)
+        page.evaluate("() => { window.ocTestBox = document.getElementById('chat-input'); }")
+        origin = page.evaluate("() => performance.timeOrigin")
+        with page.expect_response(lambda r: r.url.endswith(f"/api/v1/chats/{chat}") and r.request.method == "GET",
+                                  timeout=WAIT_MS):
+            page.evaluate(DROP_SOCKETS)   # socket.io connects again by itself
+        page.wait_for_function("() => document.getElementById('chat-input') && document.getElementById('chat-input') !== window.ocTestBox",
+                               timeout=WAIT_MS)   # Open WebUI drew a new box: the case is real
+        assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+        try:
+            page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
+        except Exception:
+            shot(page, "draft-after-reconnect")   # an old build: the empty box
+            raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+        page.wait_for_function(f"(c) => ({OWUI_DRAFT})(c).includes({json.dumps(text)})", arg=chat, timeout=WAIT_MS)
+        assert text in page.evaluate(BOX_TEXT)
+        shot(page, "draft-after-reconnect")
+    finally:
+        ctx.close()
+
+
 def test_a_sent_draft_is_not_put_back(owui, browser):
     """A draft that was sent is gone for good: after the send and a reload, the box is empty."""
     ctx, page = browser
