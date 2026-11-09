@@ -2503,6 +2503,7 @@ DRAFT_STATE = """() => ({box: document.getElementById('chat-input')?.innerText, 
   copies: Object.keys(localStorage).filter((k) => k.startsWith('oc-draft:')),
   user: (() => { try { return JSON.parse(atob(localStorage.token.split('.')[1])).id; } catch (e) { return String(e); } })()})"""
 DRAFT_COPIES = "() => Object.keys(localStorage).filter((k) => k.startsWith('oc-draft:'))"   # oc-push.js DRAFT_COPY
+COPY_OF = "(c) => Object.keys(localStorage).some((k) => k.startsWith('oc-draft:') && k.endsWith(':' + c))"   # this chat's copy
 
 
 def signed_in(ctx, token):
@@ -2582,7 +2583,7 @@ def test_a_sent_draft_is_not_put_back(owui, browser):
     page.keyboard.press("Enter")
     page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
     # Open WebUI draws the message, then sends it: the copy goes with the send.
-    page.wait_for_function(f"() => ({DRAFT_COPIES})().length === 0", timeout=WAIT_MS)
+    page.wait_for_function(f"(c) => !({COPY_OF})(c)", arg=chat, timeout=WAIT_MS)
     page.reload()
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
     page.get_by_text("a draft that is sent").first.wait_for(timeout=WAIT_MS)
@@ -2645,7 +2646,7 @@ def test_a_draft_copy_goes_once_its_chat_is_deleted_elsewhere(owui, browser):
     type_draft(page, gone, "a draft in a chat about to be deleted")
     warm(page, kept)
     type_draft(page, kept, "a draft in a chat that stays")
-    copy_of = "(c) => Object.keys(localStorage).some((k) => k.startsWith('oc-draft:') && k.endsWith(':' + c))"
+    copy_of = COPY_OF
     assert page.evaluate(copy_of, gone) and page.evaluate(copy_of, kept)
     api(f"/api/v1/chats/{gone}", token=owui, method="DELETE")
     page.reload()
