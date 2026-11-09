@@ -940,8 +940,7 @@
   // box lands after its own restore (Chat.svelte, 0.13.2). So the text the person types
   // in a chat's box is copied to localStorage, under the user and the chat, as it is
   // typed (trusted input events only: never Open WebUI's own writes), and put back when
-  // that chat is on screen with an empty box, also a new box Open WebUI draws without a
-  // page load (a socket reconnect loads the chat again). Until the person types or sends there,
+  // that chat is on screen with an empty box. Until the person types or sends there,
   // the box being emptied again (that late clear) puts it back again: Open WebUI's next
   // save then has it. The copy goes when a message is sent from that chat, when the
   // person empties the box, on a sign-out, and when its chat is gone. Text only: files
@@ -962,7 +961,7 @@
   const messageBox = () => document.getElementById("chat-input");
   const boxText = (b) => (b.editor ? b.editor.getText({ blockSeparator: LINE }) : b.innerText).trim();
   const asHtml = (t) => t.replace(/[&<>"]/g, (c) => "&#" + c.charCodeAt(0) + ";");
-  let draftChat = "", draftText = null, touched = false, draftBox = null;
+  let draftChat = "", draftText = null, touched = false;
   function draftOnScreen() {
     const chat = chatIdNow();
     if (chat === draftChat) return;
@@ -973,10 +972,6 @@
   function putDraftBack() {
     draftOnScreen();
     const b = messageBox();
-    // A new box is one Open WebUI drew, empty, on a load of the chat (a reload, or a
-    // socket reconnect with a reply unfinished: Chat.svelte handleSocketConnect), not
-    // one the person emptied: the copy goes back into it as on a page load.
-    if (b !== draftBox) { draftBox = b; touched = false; }
     if (!draftText || touched || !b?.editor || boxText(b)) return;
     b.editor.commands.setContent(draftText.split(LINE).map((l) => "<p>" + asHtml(l) + "</p>").join(""), true);
   }
