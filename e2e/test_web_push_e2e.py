@@ -2583,7 +2583,7 @@ DROP_SOCKETS = "() => window.ocTestSockets.forEach((w) => w.close())"
 
 
 def test_a_draft_outlives_a_socket_reconnect(owui, pw):
-    """The connection drops and comes back while a reply is unfinished (a phone's network change
+    """A guard, not a fail-first (green on main before and after #8): the connection drops and comes back while a reply is unfinished (a phone's network change
     while the agent answers), with no page load: Open WebUI joins the chat's room again, asks for
     its tasks and reads the chat again (Chat.svelte handleSocketConnect). The draft stays in the box."""
     chat, _ = new_chat(owui, "stub", "Chat Draft Reconnect " + uuid.uuid4().hex[:6])   # its answer: not done
@@ -2602,6 +2602,41 @@ def test_a_draft_outlives_a_socket_reconnect(owui, pw):
         assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
         shot(page, "draft-after-reconnect")
         assert text in page.evaluate(BOX_TEXT), "draft gone: " + json.dumps(page.evaluate(DRAFT_STATE))
+    finally:
+        ctx.close()
+
+
+@needs_chats
+def test_a_draft_outlives_the_reload_into_a_kept_chats_fresh_copy(owui, pw):
+    """The page script's own reload (oc-push.js CHAT_FRESH): the chat was drawn from the copy kept on
+    the device while Open WebUI's socket is down (a phone's network change), and the page reloads
+    into the network's copy once it is in. No reload by the person: the draft must be in the box after it."""
+    tag = uuid.uuid4().hex[:6]
+    chat, answer = new_chat(owui, "stub", "Chat Draft Fresh " + tag)
+    say(owui, chat, answer, "Kept reply " + tag)
+    text = "a draft before the network changed"
+    ctx = chrome(pw)
+    try:
+        page = signed_in(ctx, owui)
+        warm_kept(page, chat)
+        type_draft(page, chat, text)
+        say(owui, chat, answer, "Fresh reply " + tag)
+        ctx.route_web_socket("**/ws/socket.io/**", lambda ws: None)   # connects, the server never speaks
+        gate, undo = slow_network(ctx, owui, chat)
+        try:
+            page.reload()
+            page.get_by_text("Kept reply " + tag).first.wait_for(timeout=WAIT_MS)
+            with page.expect_event("load", timeout=WAIT_MS):   # the page script's reload into the fresh copy
+                gate.set()
+            page.get_by_text("Fresh reply " + tag).first.wait_for(timeout=WAIT_MS)
+        finally:
+            undo()
+        try:
+            page.wait_for_function(f"() => ({BOX_TEXT})().includes({json.dumps(text)})", timeout=WAIT_MS)
+        except Exception:
+            shot(page, "draft-after-fresh-reload")   # an old build: the empty box
+            raise AssertionError("draft not back: " + json.dumps(page.evaluate(DRAFT_STATE)))
+        shot(page, "draft-after-fresh-reload")
     finally:
         ctx.close()
 
