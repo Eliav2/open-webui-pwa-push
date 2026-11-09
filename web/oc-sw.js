@@ -320,7 +320,10 @@ async function act(action, data, reply) {
           new Response(JSON.stringify({ text, at: Date.now(), id: crypto.randomUUID() })));
       }
     }
-    await openChat(url + (url.includes("?") ? "&" : "?") + "oc-reply=" + (text ? "unsent" : "compose"));
+    // The reply's own chat, whatever `url` opens: for a side chat that is its parent, but
+    // the waiting text belongs in the side chat's box (oc-push.js pendingReply).
+    const own = new URL("/c/" + data.chat_id, self.location.origin).href;
+    await openChat(own + "?oc-reply=" + (text ? "unsent" : "compose"));
     return text ? "reply-failed" : "compose";
   }
   await openChat(url);

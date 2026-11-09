@@ -918,6 +918,55 @@ def test_a_tap_opens_the_chat_without_a_reload(owui, browser):
     assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
 
 
+def side_chat(token, parent, question):
+    """An Open WebUI 0.13 side chat (/btw) as its panel saves one: a chat of its own naming the parent, plus a
+    side tab for it in the user's saved view of the parent (the shape of a real one, read from a live row)."""
+    u, msg = str(uuid.uuid4()), str(uuid.uuid4())
+    msgs = {u: {"id": u, "role": "user", "content": question, "parentId": None, "childrenIds": [msg]},
+            msg: {"id": msg, "role": "assistant", "content": "", "parentId": u, "childrenIds": [], "model": "stub"}}
+    side = api("/api/v1/chats/new", {"chat": {"title": "Side SQ", "models": ["stub"], "originalChatId": parent,
+                                              "branchPointMessageId": None, "history": {"messages": msgs, "currentId": msg},
+                                              "messages": list(msgs.values())}}, token)["id"]
+    tab = str(uuid.uuid4())
+    api(f"/api/v1/chats/{parent}/view", {"state": {"schemaVersion": 1, "selectedTerminalId": None, "panels": {
+        "tabs": [{"id": "main-chat", "kind": "chat", "label": "Chat"},
+                 {"id": tab, "kind": "side", "label": question, "chatId": side, "sideChatNumber": 1}],
+        "activeId": tab, "history": ["main-chat"], "groups": [{"id": "default", "tabIds": ["main-chat", tab], "activeId": tab}],
+        "activeGroupId": "default", "layout": {"type": "group", "groupId": "default"}}}}, token)
+    return side, msg
+
+
+def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_panel(owui, browser):
+    """A reply in a side chat: the tap opens the parent chat, its panel showing the side chat, not the side
+    chat as a chat of its own. Mute, read and reply still act on the side chat."""
+    ctx, page = browser
+    token = owui
+    parent, _ = new_chat(token, "stub", "Chat SP")
+    side, msg = side_chat(token, parent, "a side question SQ")   # its own text, not its title: the sidebar lists that
+    page.goto(BASE + "/")
+    assert ready(page) in ("kept", "saved")
+    behind(ctx, page)
+    page.evaluate(CLEAR)
+    reply(token, "stub", side, msg)
+    [seen] = seen_for(page, side)
+    assert (seen["payload"]["url"], seen["payload"]["chat_id"]) == (f"/c/{parent}", side)
+    assert [n["url"] for n in page.evaluate(NOTES) if n["tag"] == f"chat-{side}"] == [f"/c/{parent}"]
+    tap(page, "", {"chat_id": side, "url": seen["payload"]["url"]})
+    page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=parent, timeout=WAIT_MS)
+    # On a phone (under 768 px) Open WebUI's panel is a sheet, closed on each load; its saved tabs come
+    # back with the chat, the side chat the active one: the navbar's Tabs button shows it. The sheet
+    # shows the side chat's answer (its question counts as context there), not the parent's empty one.
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    page.get_by_role("button", name="Tabs", exact=True).first.click()
+    sheet = page.get_by_role("dialog")
+    sheet.get_by_role("tab", name="Side SQ", selected=True).wait_for(timeout=WAIT_MS)
+    sheet.get_by_text(SECRETS[0]).first.wait_for(timeout=WAIT_MS)
+    shot(page, "side-chat-tap")
+    # A reply that could not be sent waits in the side chat's own box: that one opens the side chat.
+    assert act(page, "reply", {"chat_id": side, "url": f"/c/{parent}", "fn": "web_push"}, "") == "compose"
+    page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=side, timeout=WAIT_MS)
+
+
 def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
     """No Open WebUI window open: the service worker opens the chat in a new one (a full load), with the reply
     that could not be sent waiting in its drafts cache and ?oc-reply=unsent. SvelteKit puts the URL it loaded back

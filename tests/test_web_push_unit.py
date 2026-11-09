@@ -3,6 +3,7 @@ events only from the Pipe, and a real encrypted send (tests/web_push_roundtrip.p
 import importlib.util
 import hashlib
 import asyncio
+import contextlib
 import time
 import json
 import os
@@ -41,6 +42,10 @@ class PayloadTests(unittest.TestCase):
     def test_the_link_is_relative_whatever_the_event_says(self):
         payload = web_push.build_payload(finished(url="https://elsewhere.example/phish"))
         self.assertEqual(payload["url"], "/c/c1")
+
+    def test_the_link_can_open_another_chat_than_the_one_it_is_about(self):
+        payload = web_push.build_payload(finished(), open_chat="p1")
+        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1", "c1"))
 
     def test_a_long_title_is_cut_and_the_payload_fits(self):
         body = web_push.encode_payload(web_push.build_payload(finished(title="x" * 10000)))
@@ -187,23 +192,43 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.folder_reads = []
         reads = self.folder_reads
 
+        # The chat's own JSON (originalChatId: a side chat, a fork or a clone) and the user's panel views, per test.
+        self.chat_json = {}
+        self.views = {}
+        chat_json, views = self.chat_json, self.views
+
         class Chats:
             @staticmethod
             async def get_chat_by_id(chat_id):
-                reads.append(chat_id)
-                return types.SimpleNamespace(id=chat_id, folder_id="qa-old" if chat_id == "c1" else None)
+                return types.SimpleNamespace(id=chat_id, folder_id="qa-old" if chat_id == "c1" else None,
+                                             chat=dict(chat_json))
+
+        class ChatViewStates:
+            @staticmethod
+            async def get(user_id, chat_id, db):
+                return views.get((user_id, chat_id))
+
+        @contextlib.asynccontextmanager
+        async def get_async_db():
+            yield None
 
         class Folders:
             @staticmethod
             async def get_folders_by_user_id(user_id):
+                reads.append(user_id)
                 return [types.SimpleNamespace(id="qa", parent_id=None), types.SimpleNamespace(id="qa-old", parent_id="qa")]
         mods = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
                 "open_webui.models.functions": types.ModuleType("open_webui.models.functions"),
                 "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
-                "open_webui.models.folders": types.ModuleType("open_webui.models.folders")}
+                "open_webui.models.folders": types.ModuleType("open_webui.models.folders"),
+                "open_webui.models.chat_views": types.ModuleType("open_webui.models.chat_views"),
+                "open_webui.internal": types.ModuleType("open_webui.internal"),
+                "open_webui.internal.db": types.ModuleType("open_webui.internal.db")}
         mods["open_webui.models.functions"].Functions = Functions
         mods["open_webui.models.chats"].Chats = Chats
         mods["open_webui.models.folders"].Folders = Folders
+        mods["open_webui.models.chat_views"].ChatViewStates = ChatViewStates
+        mods["open_webui.internal.db"].get_async_db = get_async_db
         p = mock.patch.dict(sys.modules, mods)
         p.start()
         self.addCleanup(p.stop)
@@ -335,8 +360,33 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         await self.fn.event(finished(), __id__="web_push")
         self.assertEqual(len(self.sent), 1)
 
-    async def test_no_folder_mutes_reads_no_chat(self):
-        """Without a folder mute in effect, the send costs no extra read."""
+    def sent_payload(self):
+        self.assertEqual(len(self.sent), 1)
+        return json.loads(self.sent[0][1])
+
+    async def test_a_side_chat_opens_its_parent_with_the_side_chat_in_the_panel(self):
+        """Open WebUI 0.13 side chat (/btw): its own chat row, shown in the parent's side panel. The tap opens the
+        parent, whose saved panel brings the side chat back; mute, read and reply still act on the side chat."""
+        self.chat_json["originalChatId"] = "p1"
+        self.views[("u1", "p1")] = {"panels": {"tabs": [{"id": "t1", "kind": "side", "chatId": "c1"}]}}
+        await self.fn.event(finished(), __id__="web_push")
+        payload = self.sent_payload()
+        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1", "c1"))
+
+    async def test_a_fork_or_clone_opens_itself(self):
+        """A fork or a clone also names its originalChatId, but is a chat of its own: no side tab for it."""
+        self.chat_json["originalChatId"] = "p1"
+        self.views[("u1", "p1")] = {"panels": {"tabs": [{"id": "t1", "kind": "side", "chatId": "c9"}]}}
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent_payload()["url"], "/c/c1")
+
+    async def test_a_side_chat_whose_parent_has_no_view_opens_itself(self):
+        self.chat_json["originalChatId"] = "p1"
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent_payload()["url"], "/c/c1")
+
+    async def test_no_folder_mutes_reads_no_folders(self):
+        """Without a folder mute in effect, the folders are not read."""
         for raw in (None, "{}", json.dumps({"qa": 500})):
             if raw is None:
                 self.store.pop("folder_mutes", None)
