@@ -170,13 +170,12 @@
   const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
 
   // With no network, while the service worker opens the app from what it kept
-  // (offline open on: its app cache is there), the chats are read-only: a pill
-  // says so and the message box is locked (inert: no typing, no keyboard, no
-  // send), so nothing typed offline is lost on a send that cannot go. Text already
-  // in the box stays there and can be sent once the network is back.
+  // (offline open on: its app cache is there), a pill says so. The message box
+  // stays open: a message sent then waits on this device (the outbox, below).
   // A chat on screen from the copy the worker kept of it (oc-sw.js, kept chats)
-  // gets the same lock and an "Updating…" pill until Open WebUI has the network's
-  // copy: a message sent on an old copy could branch off an old point of the chat.
+  // while the network is there gets the box locked (inert) and an "Updating…" pill
+  // until Open WebUI has the network's copy: a message sent on an old copy could
+  // branch off an old point of the chat.
   const OFFLINE_PILL = "oc-offline", UPDATING_PILL = "oc-updating", NOT_SAVED_PILL = "oc-not-saved";
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const LOCKED = "ocOfflineLocked";   // data-oc-offline-locked on the locked composer
@@ -196,6 +195,9 @@
     f.dataset[LOCKED] = "1";
   }
   let offline = false;
+  const OFFLINE_TEXT = "Offline: messages are sent when you're back online";
+  const OFFLINE_NO_OUTBOX = "Offline: this browser can't keep messages, so a send now fails";
+  let outboxDb;   // the outbox's database (below); null: this browser keeps nothing
   // A chat opened offline that the worker has no copy of: it answers Open WebUI's read
   // with an error marked NOT_SAVED_HEADER, and Open WebUI takes its "chat not found" path
   // (it goes to "/"). That navigation, right after the marked read, is put back on the
@@ -217,9 +219,10 @@
     readOnly();
   }
   let unlocked = [];   // waiting for the message box to take text
-  const writable = () => (offline || updating() ? new Promise((ok) => unlocked.push(ok)) : Promise.resolve());
+  const locked = () => !offline && updating();
+  const writable = () => (locked() ? new Promise((ok) => unlocked.push(ok)) : Promise.resolve());
   function readOnly() {
-    const on = offline || updating();
+    const on = locked();
     lockComposer(on);
     if (!on) {
       for (const ok of unlocked) ok();
@@ -232,7 +235,7 @@
   function showPills() {
     const notHere = !!parked && parked === chatIdNow();
     statusPill(NOT_SAVED_PILL, notHere, "This chat isn't saved on this device. It opens when you're back online.");
-    statusPill(OFFLINE_PILL, offline && !notHere, "Offline: saved chats, read-only");
+    statusPill(OFFLINE_PILL, offline && !notHere, outboxDb === null ? OFFLINE_NO_OUTBOX : OFFLINE_TEXT);
     statusPill(UPDATING_PILL, !offline && updating(), "Updating…");
   }
   function statusPill(id, on, text) {
@@ -715,6 +718,7 @@
     stayOnChat();
     wentTo();
     readOnly();
+    outboxNow();
     const t = store.get("token");
     if (t && t !== ranFor) run();
     else chatPage();
@@ -948,6 +952,7 @@
   // keys from localStorage on each load.
   const DRAFT_COPY = "oc-draft:", LINE = "\n";
   const COMPLETIONS = "/api/chat/completions", SIGNOUT = "/api/v1/auths/signout";   // oc-sw.js SIGNOUT_PATH
+  // The signed-in user: Open WebUI's token is a JWT whose payload has its id.
   const tokenUser = () => {
     try {
       return JSON.parse(atob(store.get("token").split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id || "";
@@ -960,7 +965,6 @@
   };
   const messageBox = () => document.getElementById("chat-input");
   const boxText = (b) => (b.editor ? b.editor.getText({ blockSeparator: LINE }) : b.innerText).trim();
-  const asHtml = (t) => t.replace(/[&<>"]/g, (c) => "&#" + c.charCodeAt(0) + ";");
   let draftChat = "", draftText = null, touched = false;
   function draftOnScreen() {
     const chat = chatIdNow();
@@ -973,7 +977,7 @@
     draftOnScreen();
     const b = messageBox();
     if (!draftText || touched || !b?.editor || boxText(b)) return;
-    b.editor.commands.setContent(draftText.split(LINE).map((l) => "<p>" + asHtml(l) + "</p>").join(""), true);
+    fillBox(b, draftText);
   }
   function copyTyped() {
     const b = messageBox();
@@ -992,6 +996,14 @@
     // event: read the box once it has.
     queueMicrotask(copyTyped);
   }, true);
+  // The outbox (below) takes a text from the box: its copy goes. Its Edit puts one back
+  // in the box: the copy holds it, as if typed.
+  function setDraft(chat, text) {
+    if (!chat || !tokenUser()) return;
+    if (text) store.set(draftKey(chat), text);
+    else dropKey(draftKey(chat));
+    if (chat === draftChat) { draftText = text || null; touched = true; }
+  }
   new MutationObserver(putDraftBack).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   const draftFetch = window.fetch;
   window.fetch = function (input, init) {
@@ -1025,6 +1037,348 @@
     }
   }
   dropGoneDrafts();
+
+  // --- The outbox: a message sent with no network waits on this device and goes
+  // once the network is back, with its chat on screen (FLUSH "open").
+  // Two ways in. With no network (navigator.onLine false, offline open on), Send
+  // (Enter, the send button) is caught before Open WebUI sees it: the text leaves
+  // the box for the outbox. With a network that says it is there but carries
+  // nothing ("lie-fi"), Open WebUI's own send fails on the network: its request's
+  // message goes to the outbox. A socket that is reconnecting while HTTP works is
+  // neither: Open WebUI sends fine then.
+  // Each entry, kept in IndexedDB (it outlives the app): the chat, the message it
+  // follows, the chat's models, the text, when. The uuid is only this device's key.
+  // Not taken: a new chat (no chat yet), a chat not saved on this device, a message
+  // with files; each says why and leaves the text in the box. A browser that keeps
+  // nothing (private mode, no quota) catches nothing: Open WebUI's own send runs,
+  // and the offline pill says it fails.
+  // Going out: the chat is read from the server first, under a lock per chat
+  // (navigator.locks: two tabs never send it twice). Already there (a user message
+  // with the same text after the same message, or since it was queued): dropped,
+  // nothing sent. Chat deleted, or one of its models gone: kept, with the reason,
+  // never sent elsewhere. Otherwise the texts, joined as Open WebUI joins its own
+  // queue, go into Open WebUI's box and its Send: a reply still running takes them
+  // into Open WebUI's own queue. An entry is dropped only once the server has it.
+  // Entries of a chat not on screen: a pill says how many wait and where, and opens it.
+  const OUTBOX_DB = "oc-outbox", OUTBOX_STORE = "entries", OUTBOX_VERSION = 1, BY_CHAT = "chat";
+  const OUTBOX_LOCK = "oc-outbox-";        // + chat id
+  const OUTBOX_ID = "oc-outbox", OTHERS_PILL = "oc-outbox-elsewhere";
+  const JOIN = "\n\n";                    // Open WebUI joins its own queued messages so
+  const SEND_BUTTON = "send-message-button";
+  const POST = "POST", ENTER = "Enter", CLICK = "click", USER_ROLE = "user";
+  const UNAUTHORIZED = 401, FORBIDDEN = 403, NOT_FOUND = 404;
+  const GONE_STATUS = new Set([UNAUTHORIZED, FORBIDDEN, NOT_FOUND]);   // Open WebUI's answers for a chat that is not there
+  const WAITING = "Waiting for the network";
+  const CHAT_GONE = "Not sent: this chat no longer exists";
+  const MODEL_GONE = "Not sent: this chat's model is no longer available";
+  const NEW_CHAT_OFFLINE = "Offline: a new chat needs the network. Your text stays in the box.";
+  const NOT_SAVED_OFFLINE = "Offline: this chat isn't saved on this device. Your text stays in the box.";
+  const FILES_OFFLINE = "Offline: a message with files can't wait for the network. Your text stays in the box.";
+  const QUEUED_LIE_FI = "No network: your message waits on this device and goes when it's back.";
+  const KEEP_FAILED = "Couldn't keep this message on the device. Your text stays in the box.";
+  const MAX_OTHERS_TITLE = 40;
+  const FLUSH_TEXT_LIMIT = 100000;   // a text longer than this is no message (Open WebUI's draft limit is far below)
+
+  const idb = (r) => new Promise((ok, no) => { r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); });
+  const tx = (mode, fn) => new Promise((ok, no) => {
+    const t = outboxDb.transaction(OUTBOX_STORE, mode);
+    const r = fn(t.objectStore(OUTBOX_STORE));
+    t.oncomplete = () => ok(r?.result);
+    t.onerror = t.onabort = () => no(t.error);
+  });
+  // One user's entries are never shown to, or sent as, another (tokenUser).
+  const PROBE_KEY = "oc-outbox-probe";
+  const outboxReady = (async () => {
+    try {
+      const open = indexedDB.open(OUTBOX_DB, OUTBOX_VERSION);
+      open.onupgradeneeded = () => open.result.createObjectStore(OUTBOX_STORE, { keyPath: "uuid" }).createIndex(BY_CHAT, "chat");
+      outboxDb = await idb(open);
+      // A browser that opens the database but refuses writes (no quota) keeps nothing either.
+      await tx("readwrite", (st) => st.put({ uuid: PROBE_KEY, chat: "" }));
+      await tx("readwrite", (st) => st.delete(PROBE_KEY));
+    } catch (_) {
+      outboxDb = null;
+    }
+    showPills();
+  })();
+  async function outbox(chat) {
+    if (!outboxDb) return [];
+    const me = tokenUser();
+    const all = await tx("readonly", (st) => (chat ? st.index(BY_CHAT).getAll(chat) : st.getAll()));
+    return all.filter((x) => x.uuid !== PROBE_KEY && x.user === me).sort((a, b) => a.at - b.at);
+  }
+  const keep = (x) => tx("readwrite", (st) => st.put(x));
+  const drop = (list) => tx("readwrite", (st) => { for (const x of list) st.delete(x.uuid); });
+  const mark = (list, reason) => tx("readwrite", (st) => { for (const x of list) st.put({ ...x, reason }); });
+
+  // Open WebUI's message box is a TipTap editor; its element holds it (`.editor`).
+  // Its text (boxText, above): one line per paragraph, as Open WebUI reads it.
+  const esc = (t) => t.replace(/[&<>]/g, (c) => `&#${c.charCodeAt(0)};`);
+  // A text into the box as Open WebUI's own typing would leave it: a paragraph a line.
+  function fillBox(box, text) {
+    if (!box.editor) return false;
+    box.editor.commands.setContent(text.split(LINE).map((l) => `<p>${esc(l)}</p>`).join(""), true);
+    return true;
+  }
+  const same = (a, b) => String(a ?? "").replace(/\s+/g, " ").trim() === String(b ?? "").replace(/\s+/g, " ").trim();
+  const filesInDraft = (chat) => {   // Open WebUI's own draft of the box (sessionStorage), with its files
+    try { return (JSON.parse(sessionStorage.getItem("chat-input-" + chat) || "{}").files || []).length > 0; } catch (_) { return false; }
+  };
+  function clearBox(box) {
+    if (box.editor) return box.editor.commands.clearContent(true);
+    box.focus();
+    document.execCommand("selectAll");
+    document.execCommand("delete");
+  }
+  // The chat as the server has it now; GONE_CHAT when it is not there; nothing when
+  // the network did not answer (the worker's kept copy, or its "not saved" error).
+  const GONE_CHAT = "gone";
+  const fromServer = (chat) => fetch("/api/v1/chats/" + chat, {
+    headers: { Authorization: "Bearer " + store.get("token"), [OWN_READ]: OWN_FRESH },
+  }).then((r) => {
+    if (r.headers.has(KEPT_HEADER) || r.headers.has(NOT_SAVED_HEADER)) return null;
+    if (r.ok) return r.json();
+    return GONE_STATUS.has(r.status) ? GONE_CHAT : null;
+  }, () => null);
+  const kept = (chat) => fetch("/api/v1/chats/" + chat, {
+    headers: { Authorization: "Bearer " + store.get("token"), [OWN_READ]: OWN_KEPT },
+  }).then((r) => (r.ok ? r.json() : null), () => null);
+  const modelIds = () => fetch("/api/models", { headers: { Authorization: "Bearer " + store.get("token") } })
+    .then((r) => (r.ok ? r.json() : null)).then((j) => (j?.data ? new Set(j.data.map((m) => m.id)) : null), () => null);
+  // Already sent: a user message with this text after the message the first entry
+  // followed, or written since it was queued (this device's clock, as Open WebUI stamps it).
+  const alreadySent = (server, first, text) => Object.values(server?.chat?.history?.messages || {}).some((m) =>
+    m.role === USER_ROLE && same(m.content, text) &&
+    ((first.parent && m.parentId === first.parent) || m.timestamp >= Math.floor(first.at / MS_PER_S)));
+
+  async function add(chat, text, parent, models, title, at = Date.now()) {
+    await keep({ uuid: crypto.randomUUID(), user: tokenUser(), chat, parent, models, title, text, at });
+    drawOutbox();
+  }
+  // Send with no network: the box's text goes to the outbox. The box empties at
+  // once, as a send does (the next message can be typed right away), and gets the
+  // text back if it could not be kept.
+  async function queueFromBox(box, text) {
+    const chat = chatIdNow();
+    if (!chat) return notice(NEW_CHAT_OFFLINE);
+    if (parked === chat) return notice(NOT_SAVED_OFFLINE);
+    if (filesInDraft(chat)) return notice(FILES_OFFLINE);
+    const at = Date.now();   // the order they were sent in, whatever finishes first below
+    clearBox(box);
+    try {
+      const c = await kept(chat);   // the copy on this device: the message it ends with, its models, title
+      await add(chat, text, c?.chat?.history?.currentId ?? null, c?.chat?.models ?? [], c?.title || "", at);
+      setDraft(chat, "");
+    } catch (_) {
+      const now = document.getElementById("chat-input");
+      if (now && chatIdNow() === chat) fillBox(now, [text, boxText(now)].filter(Boolean).join(LINE));
+      notice(KEEP_FAILED);
+    }
+  }
+  const sendIntent = (e) => (e.type === KEYDOWN
+    ? e.key === ENTER && !e.shiftKey && !e.isComposing && !!e.target?.closest?.("#chat-input")
+    : !!e.target?.closest?.("#" + SEND_BUTTON));
+  for (const type of [KEYDOWN, CLICK]) {
+    document.addEventListener(type, (e) => {
+      if (navigator.onLine || !offline || !outboxDb || !sendIntent(e)) return;
+      const box = document.getElementById("chat-input");
+      const text = box ? boxText(box) : "";
+      if (!text) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queueFromBox(box, text);
+    }, true);
+  }
+
+  // Open WebUI's send (one request: the server writes the user message and answers).
+  // A network failure ("lie-fi"): its message goes to the outbox, and the page,
+  // which shows it as failed, is stale until reloaded. Any other answer from the
+  // network: a chance to send what waits.
+  let stale = "";            // a chat whose page shows a send that never reached the server
+  let sending = null;        // the outbox's own send on its way: {chat, text, done}
+  const sendBody = (init) => { try { return typeof init?.body === TEXT ? JSON.parse(init.body) : null; } catch (_) { return null; } };
+  async function sendFailed(body) {
+    const chat = body?.chat_id, msg = body?.user_message;
+    if (!chat || typeof msg?.content !== TEXT || !outboxDb) return;
+    if (sending?.chat === chat) { stale = chat; return; }   // the outbox's own: its entries are still there
+    if ((body.files || msg.files || []).length) return;
+    try {
+      await add(chat, msg.content, body.parent_id ?? msg.parentId ?? null, msg.models || [body.model].filter(Boolean), document.title);
+      stale = chat;
+      notice(QUEUED_LIE_FI);
+    } catch (_) {}
+  }
+  const outboxFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const req = input instanceof Request ? input : null;
+    const url = new URL(req ? req.url : String(input), location.href);
+    const p = outboxFetch.call(this, input, init);
+    if (url.origin !== location.origin) return p;
+    if ((init?.method || req?.method || GET).toUpperCase() === POST && url.pathname === COMPLETIONS) {
+      const body = sendBody(init);
+      return p.then((res) => {
+        if (sending && body?.chat_id === sending.chat && same(body?.user_message?.content, sending.text)) sending.done(res.ok);
+        return res;
+      }, (err) => {
+        if (sending && body?.chat_id === sending.chat) sending.done(false);
+        if (err instanceof TypeError) sendFailed(body);
+        throw err;
+      });
+    }
+    p.then((res) => { if (res.ok && waitingHere > 0) flush(); }, () => {});
+    return p;
+  };
+
+  // Going out, for the chat on screen.
+  let waitingHere = 0, flushing = false;
+  async function flush() {
+    const chat = chatIdNow();
+    if (!outboxDb || flushing || !navigator.onLine || !chat || parked === chat) return;
+    flushing = true;
+    try {
+      const run = () => flushChat(chat);
+      await (navigator.locks ? navigator.locks.request(OUTBOX_LOCK + chat, run) : run());
+    } catch (_) {
+    } finally {
+      flushing = false;
+      drawOutbox();
+    }
+  }
+  async function flushChat(chat) {
+    const list = await outbox(chat);
+    if (!list.length || chatIdNow() !== chat) return;
+    const server = await fromServer(chat);
+    if (!server) return;   // no network after all
+    if (server === GONE_CHAT) return mark(list, CHAT_GONE);
+    const text = list.map((x) => x.text).join(JOIN);
+    if (alreadySent(server, list[0], text)) return drop(list);
+    const models = [...new Set(list.flatMap((x) => x.models || []))];
+    if (models.length) {
+      const have = await modelIds();
+      if (have && models.some((m) => !have.has(m))) return mark(list, MODEL_GONE);
+    }
+    if (list.some((x) => x.reason)) await mark(list, "");
+    // The page shows a send that failed on the network: a fresh load first (its
+    // load sends what waits).
+    if (stale === chat) { location.reload(); return; }
+    await writable();
+    const box = chatIdNow() === chat ? document.getElementById("chat-input") : null;
+    if (!box || boxText(box) || text.length > FLUSH_TEXT_LIMIT) return;   // the person is writing: next time
+    if (!fillBox(box, text)) return;
+    if (!same(boxText(box), text)) { clearBox(box); return; }
+    const sent = new Promise((ok) => { sending = { chat, text, done: ok }; });
+    // After Open WebUI has read the box (its own update runs on the next frame).
+    await new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok)));
+    document.getElementById(SEND_BUTTON)?.click();
+    const ok = await sent;
+    sending = null;
+    if (ok && alreadySent(await fromServer(chat), list[0], text)) await drop(list);
+  }
+
+  // The entries of the chat on screen, above its message box; a pill for the others.
+  function bubble(x) {
+    const b = document.createElement("div");
+    b.className = "oc-outbox-item";
+    b.dataset.uuid = x.uuid;
+    b.dir = "auto";
+    b.style.cssText = "align-self:flex-end;max-width:85%;margin:4px 0;padding:8px 12px;border-radius:16px;" +
+      "background:#8882;white-space:pre-wrap;word-break:break-word;font:inherit";
+    const t = document.createElement("div");
+    t.textContent = x.text;
+    const foot = document.createElement("div");
+    foot.style.cssText = "display:flex;gap:10px;align-items:center;margin-top:4px;font-size:12px;opacity:.7";
+    const state = document.createElement("span");
+    state.textContent = x.reason || WAITING;
+    state.setAttribute("role", "status");
+    const btn = (text, fn) => {
+      const k = document.createElement("button");
+      k.type = "button";
+      k.textContent = text;
+      k.style.cssText = "background:none;border:0;padding:0;color:inherit;text-decoration:underline;cursor:pointer;font:inherit";
+      k.onclick = fn;
+      return k;
+    };
+    foot.append(state, btn("Edit", async () => {
+      const box = document.getElementById("chat-input");
+      if (!box || boxText(box)) return;
+      await drop([x]);
+      fillBox(box, x.text);
+      setDraft(x.chat, x.text);
+      box.editor?.commands.focus("end");
+      drawOutbox();
+    }), btn("Delete", async () => { await drop([x]); drawOutbox(); }));
+    b.append(t, foot);
+    return b;
+  }
+  async function drawOutbox() {
+    await outboxReady;
+    const here = chatIdNow();
+    const all = await outbox().catch(() => []);
+    const list = all.filter((x) => x.chat === here);
+    waitingHere = list.length;
+    const form = composer();
+    let wrap = document.getElementById(OUTBOX_ID);
+    if (!list.length || !form) wrap?.remove();
+    else {
+      if (!wrap || wrap.nextElementSibling !== form) {
+        wrap?.remove();
+        wrap = document.createElement("div");
+        wrap.id = OUTBOX_ID;
+        wrap.style.cssText = "display:flex;flex-direction:column;padding:0 12px";
+        form.parentElement.insertBefore(wrap, form);
+      }
+      wrap.replaceChildren(...list.map(bubble));
+    }
+    if (list.length) redraw.observe(document.documentElement, { childList: true, subtree: true });
+    else redraw.disconnect();
+    elsewhere(all.filter((x) => x.chat !== here));
+  }
+  // Open WebUI draws the box again (another chat, its first render): the entries again.
+  const redraw = new MutationObserver(() => { if (waitingHere && !document.getElementById(OUTBOX_ID)) drawOutbox(); });
+  // Open WebUI leaves a deleted chat for its home page, so its waiting messages are
+  // shown here too: checked with the server once online, and a tap puts their text
+  // back in the box on screen (when it is empty) instead of losing it.
+  const checked = new Set();   // chats the server was asked about on this page
+  async function elsewhere(others) {
+    const shown = document.getElementById(OTHERS_PILL);
+    if (!others.length || !navigator.onLine) return shown?.remove();
+    for (const c of new Set(others.filter((x) => !x.reason).map((x) => x.chat))) {
+      if (checked.has(c)) continue;
+      checked.add(c);
+      if ((await fromServer(c)) === GONE_CHAT) await mark(others.filter((x) => x.chat === c), CHAT_GONE);
+    }
+    const all = (await outbox().catch(() => [])).filter((x) => x.chat !== chatIdNow());
+    if (!all.length) return document.getElementById(OTHERS_PILL)?.remove();
+    const first = all[0];
+    const mine = all.filter((x) => x.chat === first.chat);
+    const n = mine.length;
+    const title = (first.title || "a chat").slice(0, MAX_OTHERS_TITLE);
+    const words = `${n} ${n === 1 ? "message" : "messages"}`;
+    const p = document.getElementById(OTHERS_PILL) || document.createElement("a");
+    p.id = OTHERS_PILL;
+    p.setAttribute("role", "status");
+    p.style.cssText = pill + ";top:104px;padding:6px 14px;text-decoration:none;color:#fff";
+    if (first.reason === CHAT_GONE) {
+      p.removeAttribute("href");
+      p.textContent = `${words} not sent: ${title} was deleted. Tap to put ${n === 1 ? "it" : "them"} in the box.`;
+      p.onclick = async () => {
+        const box = document.getElementById("chat-input");
+        if (!box || boxText(box) || !fillBox(box, mine.map((x) => x.text).join(JOIN))) return;
+        await drop(mine);
+        drawOutbox();
+      };
+    } else {
+      p.href = "/c/" + first.chat;   // a same-origin link: SvelteKit opens it without a load
+      p.onclick = null;
+      p.textContent = `${words} waiting in ${title}`;
+    }
+    if (!p.isConnected) document.body.appendChild(p);
+  }
+  const outboxNow = () => { drawOutbox().then(flush); };
+  addEventListener("online", outboxNow);
+  addEventListener("offline", outboxNow);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === VISIBLE) outboxNow(); });
+  window.ocOutbox = { flush, entries: outbox };   // for tests and tools, like ocPushState
 
   window.ocPushEnable = enable;
   window.ocPushMute = (seconds, id = chatIdNow()) => setMute(CHATS, id, seconds);
