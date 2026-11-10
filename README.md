@@ -225,9 +225,19 @@ In a chat that is in a folder, the bell's menu has a second part for the folder:
 
 ### Offline open
 
-With `OFFLINE` on, the service worker keeps Open WebUI itself and the chats you read last on the device, so the app opens on a slow network, or with none. With no network a pill says "Offline: saved chats, read-only" and the message box is locked, so nothing is typed that cannot be sent; text already in the box stays and can be sent once the network is back. The pill needs the device itself to be offline (the browser's `navigator.onLine`). With the device online and your server unreachable (the server, proxy or tunnel down), a kept chat opens the same way but with the "Updating…" pill of [instant chat open](#instant-chat-open), and its box stays locked until the server answers. A network that answers nothing at all is given up on after 4.2 s, then the kept copy is used. [Details](#offline-open-request-by-request).
+With `OFFLINE` on, the service worker keeps Open WebUI itself and the chats you read last on the device, so the app opens on a slow network, or with none. With no network a pill says "Offline: messages are sent when you're back online", and a message you send then [waits on the device](#sending-offline). The pill needs the device itself to be offline (the browser's `navigator.onLine`). With the device online and your server unreachable (the server, proxy or tunnel down), a kept chat opens the same way but with the "Updating…" pill of [instant chat open](#instant-chat-open), and its box stays locked until the server answers. A network that answers nothing at all is given up on after 4.2 s, then the kept copy is used. [Details](#offline-open-request-by-request).
 
 <p align="center"><img src="./docs/img/offline.png" alt="A chat on a phone with no network: Offline: saved chats, read-only, the message box greyed out" width="220"></p>
+
+### Sending offline
+
+With `OFFLINE` on, the message box stays open with no network. A message you send then waits on the device, above the box ("Waiting for the network", with Edit and Delete), and survives closing the app. Several wait in order. Once the network is back and the chat is open, they go as one message, joined with a blank line (as Open WebUI joins its own queued messages), and the waiting ones disappear once the server has it. The same happens when the device says it is online but nothing gets through and Open WebUI's send fails on the network.
+
+- Each waiting message keeps the chat and the point in the chat it was written at. It is never sent anywhere else: if the chat was deleted or its model is gone, it stays with the reason.
+- Before sending, the chat is read from the server: a message that already got there (from another tab, or before a lost answer) is not sent again. Two tabs never send it twice.
+- Messages waiting in a chat that is not open: a pill says how many wait and where, and opens that chat.
+- Not kept offline: a new chat (it has no address yet), a chat not saved on this device, and a message with files. Each says so, and your text stays in the box.
+- A browser that can't keep anything (private mode, no storage) sends as Open WebUI does, and the offline pill says the send will fail.
 
 ### Instant chat open
 

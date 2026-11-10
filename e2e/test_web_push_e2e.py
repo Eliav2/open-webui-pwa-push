@@ -1809,9 +1809,13 @@ def test_a_newer_open_webui_never_runs_the_kept_app(owui, browser):
     settled(page, f"() => ({SHELL_VERSION})().then((v) => v === {json.dumps(real)})")
 
 
-# Shorter than the 4.2 s lie-fi wait of the worker before this change (so that one waited for
-# the answer), long enough to see the app drawn without it.
-SLOW_VERSION_DELAY_S = 3
+def sw_const(name):
+    return int(re.search(rf"^const {name} = (\d+);$", open(os.path.join(ROOT, "web", "oc-sw.js")).read(), re.M).group(1))
+
+
+# How long the worker before ELI-352 waited for the network before it gave the kept app (oc-sw.js LIE_FI_MS).
+LIE_FI_MS = sw_const("SLOW_3G_SLOWEST_MS") * sw_const("SILENT_FACTOR")
+NAV_ANSWER_MS = "() => { const n = performance.getEntriesByType('navigation')[0]; return n.responseStart - n.fetchStart; }"
 
 
 @needs_offline
@@ -1823,11 +1827,12 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
     chat, _ = new_chat(owui, "stub", "Chat Instant")
     warm(page, chat)
     real = urllib.request.urlopen(OWUI + "/api/version", timeout=30).read()
-    answered = threading.Event()
+    # The network answers only once the app is drawn: the app can never be waiting on it. Whether the
+    # worker waited is its answer's time to the page, not the drawing's (that one grows with the host's load).
+    drawn = threading.Event()
     class SlowVersion(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            time.sleep(SLOW_VERSION_DELAY_S)   # a slow network's answer
-            answered.set()
+            drawn.wait(WAIT_MS / 1000)
             body, kind = (real, "application/json") if self.path == "/api/version" else (page_html, "text/html")
             self.send_response(200)
             self.send_header("Content-Type", kind)
@@ -1849,11 +1854,12 @@ def test_the_kept_app_opens_without_waiting_for_the_version(owui, browser):
     try:
         page.reload(wait_until="commit")
         page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-        assert not answered.is_set(), "the app waited for the network"
+        waited = page.evaluate(NAV_ANSWER_MS)
+        assert waited < LIE_FI_MS, f"the worker waited {waited:.0f} ms for the network"
     finally:
+        drawn.set()
         ctx.unroute("**/api/version", slow)
         ctx.unroute(f"**/c/{chat}", slow)
-        answered.wait(WAIT_MS / 1000)
         srv.shutdown()
 
 
@@ -1970,13 +1976,28 @@ MODEL_AVATARS = "img[src*='/models/model/profile/image']"
 AVATARS_DRAWN = f"""() => {{ const i = [...document.querySelectorAll("{MODEL_AVATARS}")];
     return i.length > 0 && i.every((x) => x.complete && x.naturalWidth > 0); }}"""
 COMPOSER_LOCKED = "() => !!document.getElementById('chat-input')?.closest('form')?.inert"
+# Everything on the message box or above it that keeps a tap from raising a phone's keyboard
+# (inert, readonly, disabled, inputmode none, not editable): [] when the box takes typing.
+BOX_LOCKS = """() => { const b = document.getElementById('chat-input'); if (!b) return ['no box'];
+  const why = []; if (!b.isContentEditable) why.push('not editable'); if (b.editor && !b.editor.isEditable) why.push('editor off');
+  for (let e = b; e; e = e.parentElement) for (const n of ['inert', 'readonly', 'disabled', 'aria-readonly', 'aria-disabled'])
+    if (e.hasAttribute(n) || (n === 'inert' && e.inert)) why.push((e.id || e.tagName) + ' ' + n);
+  for (let e = b; e; e = e.parentElement) if (e.getAttribute('inputmode') === 'none') why.push((e.id || e.tagName) + ' inputmode none');
+  return why; }"""
+# From now on, every lock BOX_LOCKS looks for that is set on the box or above it, even if taken off again.
+WATCH_LOCKS = """() => { window.__ocLocks = []; const names = ['inert', 'readonly', 'disabled', 'inputmode', 'contenteditable', 'aria-readonly', 'aria-disabled'];
+  new MutationObserver((ms) => { const b = document.getElementById('chat-input');
+    for (const m of ms) if (b && (m.target === b || m.target.contains(b)) && m.target.hasAttribute(m.attributeName)
+        && !(m.attributeName === 'contenteditable' && m.target.getAttribute('contenteditable') === 'true'))
+      window.__ocLocks.push((m.target.id || m.target.tagName) + ' ' + m.attributeName + '=' + m.target.getAttribute(m.attributeName)); })
+    .observe(document.documentElement, {attributes: true, attributeFilter: names, subtree: true}); return 1; }"""
+OFFLINE_TEXT = "Offline: messages are sent when you're back online"   # oc-push.js
 
 
 @needs_offline
-def test_offline_is_read_only_with_a_pill_and_keeps_the_avatars(owui, browser):
-    """Opened offline, the saved chat shows a pill and a locked message box (typing does nothing,
-    so nothing is written to be lost) and the model's picture (kept), not a broken image. The
-    network going while text is in the box: the text stays, locked, and is sent once online."""
+def test_offline_shows_a_pill_keeps_the_box_open_and_the_avatars(owui, browser):
+    """Opened offline, the saved chat shows a pill, the model's picture (kept, not a broken
+    image), and a message box that still takes text (a message sent then waits: the outbox)."""
     ctx, page = browser
     page.bring_to_front()
     chat, _ = new_chat(owui, "stub", "Chat Pill")
@@ -1989,39 +2010,42 @@ def test_offline_is_read_only_with_a_pill_and_keeps_the_avatars(owui, browser):
         page.reload(timeout=WAIT_MS)
         box.wait_for(timeout=WAIT_MS)
         pill.wait_for(timeout=WAIT_MS)
-        assert pill.inner_text() == "Offline: saved chats, read-only"
-        page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
+        assert pill.inner_text() == OFFLINE_TEXT
         page.wait_for_function(AVATARS_DRAWN, timeout=WAIT_MS)
-        if os.environ.get("E2E_SHOTS"):
-            page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offline-pill.png"))
-        box.click(force=True)
+        assert not page.evaluate(COMPOSER_LOCKED), "the message box is locked offline"
+        assert page.evaluate(BOX_LOCKS) == [], "the message box can't take the keyboard offline"
+        box.focus()
         page.keyboard.type("typed offline")
-        page.keyboard.press("Enter")
-        assert "typed offline" not in box.inner_text(), "the locked box took text offline"
+        assert "typed offline" in box.inner_text()
+        shot(page, "web-push-offline-pill")
     finally:
         ctx.set_offline(False)
     pill.wait_for(state="detached", timeout=WAIT_MS)
-    page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
-    # Text in the box when the network goes.
-    text = "written before the network went"
-    box.click()
-    page.keyboard.type(text)
+
+
+@needs_offline
+def test_the_network_going_with_the_chat_open_never_locks_the_box(owui, browser):
+    """The network goes while the chat is on screen (a phone into airplane mode): the box is never
+    made readonly, inert, disabled or keyboard-less on the way, not even for a moment, and a real
+    click puts the focus in it and takes typing."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Box Open " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    box = page.locator("#chat-input")
+    page.evaluate(WATCH_LOCKS)
     ctx.set_offline(True)
     try:
-        pill.wait_for(timeout=WAIT_MS)
-        page.wait_for_function(COMPOSER_LOCKED, timeout=WAIT_MS)
-        page.keyboard.press("Enter")
-        assert text in box.inner_text(), "the text in the box was lost"
-        assert not any(m.get("content") == text for m in history(owui, chat)["messages"].values())
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        assert page.evaluate(BOX_LOCKS) == [], "the message box can't take the keyboard offline"
+        box.click()
+        assert page.evaluate("() => !!document.activeElement?.closest('#chat-input')"), "a click doesn't focus the box"
+        page.keyboard.type("typed after the network went")
+        assert "typed after the network went" in box.inner_text()
+        assert page.evaluate("() => window.__ocLocks") == [], "the box was locked on the way offline"
+        page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
     finally:
         ctx.set_offline(False)
-    page.wait_for_function(f"() => !({COMPOSER_LOCKED})()", timeout=WAIT_MS)
-    box.click()
-    page.keyboard.press("Enter")
-    end = time.time() + WAIT_MS / 1000
-    while not any(m.get("content") == text for m in history(owui, chat)["messages"].values()):
-        assert time.time() < end, "the kept text was never sent"
-        time.sleep(STATE_POLL_S)
 
 
 @needs_offline
@@ -2774,3 +2798,256 @@ def test_a_draft_copy_goes_once_its_chat_is_deleted_elsewhere(owui, browser):
     page.wait_for_function(f"(c) => !({copy_of})(c)", arg=gone, timeout=WAIT_MS)
     assert page.evaluate(copy_of, kept), "the copy of a chat that still exists was dropped"
     page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
+
+
+# --- The outbox: a message sent with no network waits on the device and goes once
+# the network is back, as one message, once.
+
+OUTBOX_ITEM = "#oc-outbox .oc-outbox-item"
+OUTBOX_COUNT = "() => window.ocOutbox ? window.ocOutbox.entries().then((l) => l.length) : -1"
+NOTICE = "#oc-push-notice"
+SEND_FAILED_ON_NETWORK = "internetdisconnected"
+
+
+def lines(text):
+    """A message's lines, blank ones left out: Open WebUI writes a blank line of its box as "  "."""
+    return "\n".join(x.strip() for x in str(text).splitlines() if x.strip())
+
+
+def user_texts(token, chat):
+    return [lines(m.get("content")) for m in history(token, chat)["messages"].values() if m["role"] == "user"]
+
+
+def wait_user_texts(token, chat, want):
+    """Until the server's user messages are `want` (a poll of the saved chat)."""
+    end = time.time() + WAIT_MS / 1000
+    while user_texts(token, chat) != want:
+        assert time.time() < end, f"server user messages {user_texts(token, chat)} != {want}"
+        time.sleep(STATE_POLL_S)
+
+
+def settled_none_sent(page, token, chat, want):
+    """Nothing more is sent: the outbox is empty and the server has `want` (one state each)."""
+    settled(page, f"() => ({OUTBOX_COUNT})().then((n) => n === 0)")
+    assert user_texts(token, chat) == want
+
+
+def send(page, text):
+    page.locator("#chat-input").focus()
+    page.keyboard.type(text)
+    page.keyboard.press("Enter")
+
+
+@needs_offline
+def test_messages_sent_offline_wait_and_go_once_as_one_message(owui, browser):
+    """Two messages sent offline wait above the box (they outlive a reload), the box is empty, the
+    server has nothing; back online they go as ONE message, joined with a blank line, and the
+    waiting ones go. A load afterwards sends nothing again."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Outbox " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        send(page, "first offline")
+        send(page, "second offline")
+        page.locator(OUTBOX_ITEM).nth(1).wait_for(timeout=WAIT_MS)
+        assert page.locator("#chat-input").inner_text().strip() == ""
+        shot(page, "outbox-waiting")
+        page.reload(timeout=WAIT_MS)
+        page.locator(OUTBOX_ITEM).nth(1).wait_for(timeout=WAIT_MS)
+        assert page.locator(OUTBOX_ITEM).count() == 2
+        # What waits is not also a draft: no copy of it, and the box stays empty.
+        assert not page.evaluate(COPY_OF, chat), "a text in the outbox kept its draft copy"
+        assert page.evaluate(BOX_TEXT).strip() == ""
+        assert user_texts(owui, chat) == ["hi"]
+    finally:
+        ctx.set_offline(False)
+    wait_user_texts(owui, chat, ["hi", "first offline\nsecond offline"])
+    page.locator(OUTBOX_ITEM).first.wait_for(state="detached", timeout=WAIT_MS)
+    settled_none_sent(page, owui, chat, ["hi", "first offline\nsecond offline"])
+    page.reload()
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    settled_none_sent(page, owui, chat, ["hi", "first offline\nsecond offline"])
+
+
+@needs_offline
+def test_a_send_that_fails_on_the_network_waits_and_goes_once(owui, browser):
+    """Lie-fi: the device says online, Open WebUI's send fails on the network. The message waits
+    on the device and goes once on the next load with a network, never twice."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Lie-fi " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    page.route("**/api/chat/completions", lambda r: r.abort(SEND_FAILED_ON_NETWORK))
+    try:
+        send(page, "sent on lie-fi")
+        page.locator(OUTBOX_ITEM).first.wait_for(timeout=WAIT_MS)
+        page.locator(NOTICE).wait_for(timeout=WAIT_MS)
+        assert user_texts(owui, chat) == ["hi"]
+    finally:
+        page.unroute("**/api/chat/completions")
+    page.reload()
+    wait_user_texts(owui, chat, ["hi", "sent on lie-fi"])
+    settled_none_sent(page, owui, chat, ["hi", "sent on lie-fi"])
+
+
+@needs_offline
+def test_two_tabs_back_online_together_send_it_once(owui, browser):
+    """The same waiting message in two tabs of the chat, both back online at once: one message."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Two Tabs " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    other = ctx.new_page()
+    try:
+        other.goto(f"{BASE}/c/{chat}")
+        other.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        ctx.set_offline(True)
+        try:
+            page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+            send(page, "from two tabs")
+            page.locator(OUTBOX_ITEM).first.wait_for(timeout=WAIT_MS)
+            other.reload(timeout=WAIT_MS)
+            other.locator(OUTBOX_ITEM).first.wait_for(timeout=WAIT_MS)
+        finally:
+            ctx.set_offline(False)
+        wait_user_texts(owui, chat, ["hi", "from two tabs"])
+        for p in (page, other):
+            settled_none_sent(p, owui, chat, ["hi", "from two tabs"])
+    finally:
+        other.close()
+
+
+@needs_offline
+def test_messages_waiting_in_another_chat_say_where_and_go_only_there(owui, browser):
+    """A message waits in chat A; the page is on chat B when the network is back: a pill says how
+    many wait and where; nothing is sent until A is open (from the pill), then once, in A."""
+    ctx, page = browser
+    page.bring_to_front()
+    tag = uuid.uuid4().hex[:6]
+    a, _ = new_chat(owui, "stub", "Chat Waiting " + tag)
+    b, _ = new_chat(owui, "stub", "Chat Elsewhere " + tag)
+    warm(page, b)
+    warm(page, a)
+    ctx.set_offline(True)
+    try:
+        page.reload(timeout=WAIT_MS)
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        send(page, "waiting in A")
+        page.locator(OUTBOX_ITEM).first.wait_for(timeout=WAIT_MS)
+        page.goto(f"{BASE}/c/{b}")
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    finally:
+        ctx.set_offline(False)
+    others = page.locator("#oc-outbox-elsewhere")
+    others.wait_for(timeout=WAIT_MS)
+    assert others.inner_text() == f"1 message waiting in Chat Waiting {tag}"
+    shot(page, "outbox-elsewhere")
+    assert user_texts(owui, a) == ["hi"] and user_texts(owui, b) == ["hi"]
+    others.click()
+    page.wait_for_url(f"**/c/{a}", timeout=WAIT_MS)
+    wait_user_texts(owui, a, ["hi", "waiting in A"])
+    settled_none_sent(page, owui, a, ["hi", "waiting in A"])
+    assert user_texts(owui, b) == ["hi"]
+
+
+@needs_offline
+def test_a_waiting_message_whose_chat_was_deleted_stays_with_the_reason(owui, browser):
+    """The chat is deleted while its message waits: back online, nothing is sent anywhere and the
+    waiting message says why."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Deleted " + uuid.uuid4().hex[:6])
+    warm(page, chat)
+    ctx.set_offline(True)
+    try:
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        send(page, "to a chat that goes")
+        page.locator(OUTBOX_ITEM).first.wait_for(timeout=WAIT_MS)
+        req = urllib.request.Request(f"{OWUI}/api/v1/chats/{chat}", method="DELETE", headers={"Authorization": "Bearer " + owui})
+        urllib.request.urlopen(req, timeout=30).read()
+    finally:
+        ctx.set_offline(False)
+    # Two places can say why, both keeping the message: the bubble above the box while the page is
+    # on the chat, or the pill on another page (Open WebUI may leave a deleted chat for its home page).
+    page.wait_for_function("""() => [...document.querySelectorAll('#oc-outbox .oc-outbox-item')].some((b) =>
+        b.innerText.includes('no longer exists')) || !!document.getElementById('oc-outbox-elsewhere')?.innerText.includes('was deleted')""",
+                           timeout=WAIT_MS)
+    shot(page, "outbox-chat-gone")
+    assert page.evaluate(OUTBOX_COUNT) == 1
+    page.goto(BASE + "/")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    others = page.locator("#oc-outbox-elsewhere")
+    page.wait_for_function("() => !!document.getElementById('oc-outbox-elsewhere')?.innerText.includes('was deleted')", timeout=WAIT_MS)
+    others.click()
+    page.wait_for_function("() => document.getElementById('chat-input')?.innerText.includes('to a chat that goes')", timeout=WAIT_MS)
+    settled(page, f"() => ({OUTBOX_COUNT})().then((n) => n === 0)")
+    page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
+
+
+@needs_offline
+def test_a_new_chat_offline_is_not_taken_and_the_text_stays(owui, browser):
+    """Offline on a new chat (no chat yet): Send says why and the text stays in the box."""
+    ctx, page = browser
+    page.bring_to_front()
+    chat, _ = new_chat(owui, "stub", "Chat Before New")
+    warm(page, chat)
+    page.goto(BASE + "/")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    before = page.evaluate(OUTBOX_COUNT)
+    ctx.set_offline(True)
+    try:
+        page.locator("#oc-offline").wait_for(timeout=WAIT_MS)
+        send(page, "a new chat offline")
+        page.locator(NOTICE).wait_for(timeout=WAIT_MS)
+        assert "new chat needs the network" in page.locator(NOTICE).inner_text()
+        assert "a new chat offline" in page.locator("#chat-input").inner_text()
+        assert page.evaluate(OUTBOX_COUNT) == before
+    finally:
+        ctx.set_offline(False)
+    page.evaluate("() => document.getElementById('chat-input').editor.commands.clearContent(true)")
+
+
+@needs_offline
+def test_a_browser_that_keeps_nothing_sends_as_open_webui_does_and_says_so(owui, pw):
+    """No IndexedDB (private mode, no storage): Send is left to Open WebUI, the offline pill says a
+    send fails, and the text is not lost silently (Open WebUI shows the failed message)."""
+    chat, _ = new_chat(owui, "stub", "Chat No Storage")
+    ctx, page = own_chrome(pw, owui)
+    ctx.add_init_script("indexedDB.open = () => { throw new DOMException('no storage', 'InvalidStateError'); };")
+    try:
+        warm(page, chat)
+        ctx.set_offline(True)
+        try:
+            page.reload(timeout=WAIT_MS)
+            pill = page.locator("#oc-offline")
+            pill.wait_for(timeout=WAIT_MS)
+            page.wait_for_function("() => document.getElementById('oc-offline')?.innerText.includes('keep messages')", timeout=WAIT_MS)
+            send(page, "no storage here")
+            page.locator(".user-message", has_text="no storage here").wait_for(timeout=WAIT_MS)
+            assert page.locator(OUTBOX_ITEM).count() == 0
+        finally:
+            ctx.set_offline(False)
+    finally:
+        ctx.close()
+
+
+def test_a_reconnecting_socket_with_http_up_sends_at_once(owui, pw):
+    """The socket never comes up while HTTP works ("reconnecting"): that is not offline. Send goes
+    to the server at once and nothing waits."""
+    chat, _ = new_chat(owui, "stub", "Chat Socket Down " + uuid.uuid4().hex[:6])
+    ctx, page = own_chrome(pw, owui)
+    try:
+        warm(page, chat)
+        ctx.route_web_socket("**/ws/socket.io/**", lambda ws: None)   # connects, the server never speaks
+        page.reload()
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+        send(page, "socket down, http up")
+        wait_user_texts(owui, chat, ["hi", "socket down, http up"])
+        assert page.locator(OUTBOX_ITEM).count() == 0
+        assert page.evaluate(OUTBOX_COUNT) in (0, -1)
+    finally:
+        ctx.close()
