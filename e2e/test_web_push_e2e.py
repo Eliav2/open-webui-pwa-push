@@ -966,8 +966,8 @@ def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_pa
 
 
 def test_a_side_chats_tap_with_the_parent_already_open_shows_the_side_chat(owui, browser):
-    """The parent is on screen, its sheet closed and its main tab the selected one (the side chat's tab is
-    in its panel): the tap opens the sheet and selects the side chat's tab, with no load."""
+    """The parent is on screen with its sheet closed (on a phone the sheet lists only the side tabs, the main
+    chat being the page itself): the tap opens the sheet on the side chat's tab, with no load."""
     ctx, page = browser
     token = owui
     parent, _ = new_chat(token, "stub", "Chat SO")
@@ -975,12 +975,7 @@ def test_a_side_chats_tap_with_the_parent_already_open_shows_the_side_chat(owui,
     page.goto(BASE + f"/c/{parent}")
     assert ready(page) in ("kept", "saved")
     page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-    tabs_button = page.get_by_role("button", name="Tabs", exact=True).first
-    tabs_button.click()
-    page.get_by_role("dialog").get_by_role("tab", name="Chat SO").click()   # the main tab, not the side chat's
-    page.get_by_role("dialog").get_by_role("tab", name="Chat SO", selected=True).wait_for(timeout=WAIT_MS)
-    tabs_button.click()   # the sheet closed again
-    page.get_by_role("dialog").wait_for(state="hidden", timeout=WAIT_MS)
+    assert page.get_by_role("dialog").count() == 0, "the sheet starts closed"
     origin = page.evaluate("() => performance.timeOrigin")
     tap(page, "", {"chat_id": side, "url": f"/c/{parent}?oc-side={side}"})
     page.get_by_role("dialog").get_by_role("tab", name="Side SQ", selected=True).wait_for(timeout=WAIT_MS)
