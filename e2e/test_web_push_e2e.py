@@ -1001,7 +1001,7 @@ def test_the_page_script_finds_open_webuis_tabs_button_and_tab_by_structure(owui
     found = page.evaluate("(s) => [...document.querySelectorAll(s)].map((b) => b.getAttribute('aria-label'))", selector)
     assert found == ["Tabs"], found
     view = api(f"/api/v1/chats/{parent}/view", None, token, method="GET")
-    tab = next(t for t in view["panels"]["tabs"] if t["kind"] == "side" and t["chatId"] == side)
+    tab = next(t for t in view["state"]["panels"]["tabs"] if t["kind"] == "side" and t["chatId"] == side)
     page.locator(selector).click()
     page.locator(f"[id='chat-panel-{tab['id']}']").wait_for(timeout=WAIT_MS)
 

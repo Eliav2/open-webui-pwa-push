@@ -43,7 +43,7 @@ function page({ panel, tabs, search = "?oc-side=" + SIDE, activeId = TAB }) {
   const fetch = async (url) => {
     if (String(url).endsWith("/api/v1/chats/" + PARENT + "/view")) {
       views.push(String(url));
-      return new Response(JSON.stringify({ panels: { tabs, activeId } }), { status: 200 });
+      return new Response(JSON.stringify({ state: { panels: { tabs, activeId } } }), { status: 200 });
     }
     return new Response("{}", { status: 200 });
   };

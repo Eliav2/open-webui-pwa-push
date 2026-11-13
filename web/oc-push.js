@@ -646,7 +646,7 @@
     q.delete(SIDE_PARAM);
     history.replaceState(history.state, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
     const view = await call("/api/v1/chats/" + id + "/view", undefined, OWN_FRESH).catch(() => null);
-    const tab = ((view?.panels?.tabs) || []).find((t) => t.kind === SIDE_TAB && t.chatId === side);
+    const tab = ((view?.state?.panels?.tabs) || []).find((t) => t.kind === SIDE_TAB && t.chatId === side);
     if (!tab) return;
     const el = () => document.getElementById("chat-panel-" + encodeURIComponent(tab.id));
     if (!shown(el())) {
