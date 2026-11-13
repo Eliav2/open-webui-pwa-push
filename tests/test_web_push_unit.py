@@ -45,7 +45,7 @@ class PayloadTests(unittest.TestCase):
 
     def test_the_link_can_open_another_chat_than_the_one_it_is_about(self):
         payload = web_push.build_payload(finished(), open_chat="p1")
-        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1", "c1"))
+        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1?oc-side=c1", "c1"))
 
     def test_a_long_title_is_cut_and_the_payload_fits(self):
         body = web_push.encode_payload(web_push.build_payload(finished(title="x" * 10000)))
@@ -371,7 +371,8 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.views[("u1", "p1")] = {"panels": {"tabs": [{"id": "t1", "kind": "side", "chatId": "c1"}]}}
         await self.fn.event(finished(), __id__="web_push")
         payload = self.sent_payload()
-        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1", "c1"))
+        # ?oc-side names the side chat: on a phone the page opens the panel sheet on its tab.
+        self.assertEqual((payload["url"], payload["chat_id"]), ("/c/p1?oc-side=c1", "c1"))
 
     async def test_a_fork_or_clone_opens_itself(self):
         """A fork or a clone also names its originalChatId, but is a chat of its own: no side tab for it."""

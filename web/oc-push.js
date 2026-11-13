@@ -620,6 +620,43 @@
       if (mine) replyWaiting.delete(id);
     }
   }
+  // A side chat's notification opens its parent with ?oc-side=<side chat> (oc-sw.js does not touch it).
+  // Open WebUI's panel shows the side chat as a tab of the parent's saved view. On a screen that shows
+  // the panel the tab is there; on a phone the panel is a sheet that starts closed on every load, opened
+  // by the navbar's Tabs button. Both are found by structure, which is Open WebUI's contract here
+  // (ChatTabs.svelte, Navbar.svelte, 0.13): the Tabs button is the navbar's one button with aria-expanded
+  // and no menu behind it (its label is translated), and a tab's element id is `chat-panel-<tab id>`.
+  const SIDE_PARAM = "oc-side", SIDE_TAB = "side";
+  const TABS_BUTTON = "nav button[aria-expanded]:not([aria-haspopup])";
+  const PANEL_WAIT_MS = 15000;
+  const ARIA = Object.freeze({ no: "false", yes: "true" });   // an aria-* attribute's two values
+  function appears(find) {
+    return new Promise((ok) => {
+      if (find()) return ok(find());
+      const o = new MutationObserver(() => { if (find()) { o.disconnect(); ok(find()); } });
+      o.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      setTimeout(() => { o.disconnect(); ok(find()); }, PANEL_WAIT_MS);
+    });
+  }
+  async function pendingSide() {
+    const id = chatIdNow();
+    const q = new URLSearchParams(location.search);
+    const side = q.get(SIDE_PARAM);
+    if (!id || !side) return;
+    q.delete(SIDE_PARAM);
+    history.replaceState(history.state, "", location.pathname + (q.size ? "?" + q : "") + location.hash);
+    const view = await call("/api/v1/chats/" + id + "/view", undefined, OWN_FRESH).catch(() => null);
+    const tab = ((view?.panels?.tabs) || []).find((t) => t.kind === SIDE_TAB && t.chatId === side);
+    if (!tab) return;
+    const el = () => document.getElementById("chat-panel-" + encodeURIComponent(tab.id));
+    if (!shown(el())) {
+      const button = await appears(() => document.querySelector(TABS_BUTTON));
+      if (button?.getAttribute("aria-expanded") === ARIA.no) button.click();
+    }
+    const tabEl = await appears(() => (shown(el()) ? el() : null));
+    if (tabEl && chatIdNow() === id && tabEl.getAttribute("aria-selected") !== ARIA.yes) tabEl.click();
+    window.ocPushSide = { chat: id, side, opened: !!tabEl };   // for tests and tools
+  }
   async function putReply(id, mode) {
     let text = "", drafts = null, draft = null;
     const key = "/oc-push/draft/" + id;
@@ -683,6 +720,7 @@
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
     pendingReply();
+    pendingSide();
     const id = chatIdNow();
     if (id && chatFolder.chat !== id) loadFolder(id).then(drawBell).catch(() => {});
   }
