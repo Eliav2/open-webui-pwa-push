@@ -42,6 +42,8 @@ LABEL_DOT = "."   # a bare name (no dot) is no public host
 # Open WebUI 0.13's chat_view_state contract (models/chat_views.py PanelTab.kind): a side chat
 # (/btw) sits in its parent's saved view as a tab of this kind, naming the side chat in chatId.
 SIDE_TAB_KIND = "side"
+# The parent's URL names the side chat in this query parameter: oc-push.js opens the panel on its tab.
+SIDE_PARAM = "oc-side"
 # Written into the user's own valves (push_problem) when nothing can be sent; the page shows it.
 NO_SUBJECT = ("Notifications can't be sent yet: the admin must set VAPID_SUBJECT in the Web Push "
               "function's valves (a mailto: address or an https: URL on a public host), since WEBUI_URL is not one.")
@@ -146,7 +148,7 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: li
     title = str(data.get("title") or event.get("message") or "Reply finished")[:MAX_TITLE_CHARS]
     payload = {"v": 2, "kind": event.get("event"), "source": event.get("source"), "chat_id": chat_id,
                "message_id": data.get("message_id"), "title": title,
-               "url": f"/c/{open_chat or chat_id}" if chat_id else "/"}
+               "url": (f"/c/{open_chat}?{SIDE_PARAM}={chat_id}" if open_chat else f"/c/{chat_id}") if chat_id else "/"}
     if fn:
         payload["fn"] = fn
     if not swipe_read:

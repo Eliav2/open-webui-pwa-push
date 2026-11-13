@@ -949,15 +949,13 @@ def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_pa
     page.evaluate(CLEAR)
     reply(token, "stub", side, msg)
     [seen] = seen_for(page, side)
-    assert (seen["payload"]["url"], seen["payload"]["chat_id"]) == (f"/c/{parent}", side)
-    assert [n["url"] for n in page.evaluate(NOTES) if n["tag"] == f"chat-{side}"] == [f"/c/{parent}"]
+    assert (seen["payload"]["url"], seen["payload"]["chat_id"]) == (f"/c/{parent}?oc-side={side}", side)
+    assert [n["url"] for n in page.evaluate(NOTES) if n["tag"] == f"chat-{side}"] == [f"/c/{parent}?oc-side={side}"]
     tap(page, "", {"chat_id": side, "url": seen["payload"]["url"]})
     page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=parent, timeout=WAIT_MS)
-    # On a phone (under 768 px) Open WebUI's panel is a sheet, closed on each load; its saved tabs come
-    # back with the chat, the side chat the active one: the navbar's Tabs button shows it. The sheet
-    # shows the side chat's answer (its question counts as context there), not the parent's empty one.
-    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
-    page.get_by_role("button", name="Tabs", exact=True).first.click()
+    # On a phone (under 768 px) Open WebUI's panel is a sheet, closed on each load: the page script opens
+    # it on the side chat's tab (no press of the navbar's Tabs button here). The sheet shows the side chat's
+    # answer (its question counts as context there), not the parent's empty one.
     sheet = page.get_by_role("dialog")
     sheet.get_by_role("tab", name="Side SQ", selected=True).wait_for(timeout=WAIT_MS)
     sheet.get_by_text(SECRETS[0]).first.wait_for(timeout=WAIT_MS)
@@ -965,6 +963,42 @@ def test_a_side_chats_notification_opens_its_parent_with_the_side_chat_in_the_pa
     # A reply that could not be sent waits in the side chat's own box: that one opens the side chat.
     assert act(page, "reply", {"chat_id": side, "url": f"/c/{parent}", "fn": "web_push"}, "") == "compose"
     page.wait_for_function("(c) => location.pathname === '/c/' + c", arg=side, timeout=WAIT_MS)
+
+
+def test_a_side_chats_tap_with_the_parent_already_open_shows_the_side_chat(owui, browser):
+    """The parent is on screen with its sheet closed (on a phone the sheet lists only the side tabs, the main
+    chat being the page itself): the tap opens the sheet on the side chat's tab, with no load."""
+    ctx, page = browser
+    token = owui
+    parent, _ = new_chat(token, "stub", "Chat SO")
+    side, _ = side_chat(token, parent, "an open side question SO")
+    page.goto(BASE + f"/c/{parent}")
+    assert ready(page) in ("kept", "saved")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    assert page.get_by_role("dialog").count() == 0, "the sheet starts closed"
+    origin = page.evaluate("() => performance.timeOrigin")
+    tap(page, "", {"chat_id": side, "url": f"/c/{parent}?oc-side={side}"})
+    page.get_by_role("dialog").get_by_role("tab", name="Side SQ", selected=True).wait_for(timeout=WAIT_MS)
+    assert page.evaluate("() => performance.timeOrigin") == origin, "the page was loaded again"
+
+
+def test_the_page_script_finds_open_webuis_tabs_button_and_tab_by_structure(owui, browser):
+    """The DOM contract of oc-push.js pendingSide, pinned against the real Open WebUI: its Tabs button is
+    found without its (translated) label, and a side chat's tab has the id `chat-panel-<tab id>`."""
+    ctx, page = browser
+    token = owui
+    parent, _ = new_chat(token, "stub", "Chat SC")
+    side, _ = side_chat(token, parent, "a contract side question SC")
+    page.goto(BASE + f"/c/{parent}")
+    assert ready(page) in ("kept", "saved")
+    page.locator("#chat-input").wait_for(timeout=WAIT_MS)
+    selector = re.search(r'TABS_BUTTON = "([^"]+)"', open(os.path.join(ROOT, "web", "oc-push.js")).read()).group(1)
+    found = page.evaluate("(s) => [...document.querySelectorAll(s)].map((b) => b.getAttribute('aria-label'))", selector)
+    assert found == ["Tabs"], found
+    view = api(f"/api/v1/chats/{parent}/view", None, token, method="GET")
+    tab = next(t for t in view["state"]["panels"]["tabs"] if t["kind"] == "side" and t["chatId"] == side)
+    page.locator(selector).click()
+    page.locator(f"[id='chat-panel-{tab['id']}']").wait_for(timeout=WAIT_MS)
 
 
 def test_an_unsent_reply_opened_by_a_full_load_is_put_in_the_box_once(owui, pw):
