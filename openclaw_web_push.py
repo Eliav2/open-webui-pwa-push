@@ -2,13 +2,13 @@
 title: Web Push notifications
 author: Eliav2
 author_url: https://github.com/Eliav2/open-webui-pwa-push
-version: 0.6.0
+version: 0.7.0
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
 """
 # Docs: README.md. The page script (web/oc-push.js) keeps
-# each device's subscription in this function's user valves; the service
-# worker (web/oc-sw.js) shows the notification.
+# each device's subscription in this function's state, in the user's Open WebUI
+# settings (STATE_KEY_PREFIX); the service worker (web/oc-sw.js) shows the notification.
 import asyncio
 import base64
 import hashlib
@@ -44,7 +44,7 @@ LABEL_DOT = "."   # a bare name (no dot) is no public host
 SIDE_TAB_KIND = "side"
 # The parent's URL names the side chat in this query parameter: oc-push.js opens the panel on its tab.
 SIDE_PARAM = "oc-side"
-# Written into the user's own valves (push_problem) when nothing can be sent; the page shows it.
+# Written into the user's own state (push_problem) when nothing can be sent; the page shows it.
 NO_SUBJECT = ("Notifications can't be sent yet: the admin must set VAPID_SUBJECT in the Web Push "
               "function's valves (a mailto: address or an https: URL on a public host), since WEBUI_URL is not one.")
 # A push service that never answers: the send is given up. A safety net for a
@@ -75,8 +75,14 @@ FINGERPRINT_CHARS = 32    # hex digits of the endpoint's SHA-256 (web/oc-push.js
 # The notification's buttons the service worker knows (web/oc-sw.js):
 # reply in the shade, mark the chat read, mute it for 8 hours.
 KNOWN_ACTIONS = ("reply", "read", "mute")
-# Mute writes this function's user valves, so it needs the function's id.
+# Mute writes this function's state, so it needs the function's id.
 NEEDS_FUNCTION_ID = ("mute",)
+# What the page script, the service worker and this function write for each user (subscriptions, mutes,
+# folder_mutes, gone, push_problem, and swipe_read from 0.6.0): a key in the user's Open WebUI settings, which no
+# Open WebUI page shows. They were user valves, and a function with user valves gets a valves button in the
+# composer and a Controls panel entry whose save can write stale values back (ELI-442). Open WebUI 0.13's
+# settings update replaces only the top-level keys it is sent, so each writer sends this one key.
+STATE_KEY_PREFIX = "web_push:"
 DEFAULT_KEY_FILE = os.path.join(os.environ.get("DATA_DIR", "/app/backend/data"), "web-push", "vapid_private.pem")
 
 
@@ -141,7 +147,7 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: li
                   swipe_read: bool = True, icon: str = "", badge: str = "", open_chat: str = "") -> dict:
     """What the device gets: the chat's title and where to open it (`open_chat`, a side
     chat's parent, else the chat itself), the id of this function (the service worker's
-    Mute writes its user valves), and, only with `preview_chars`, the start of the reply.
+    Mute writes its state), and, only with `preview_chars`, the start of the reply.
     `data.message` holds the whole reply (Open WebUI 0.13.0 and the Pipe); it is never sent whole."""
     data = event.get("data") or {}
     chat_id = str(data.get("chat_id") or "")
@@ -186,7 +192,7 @@ def encode_payload(payload: dict) -> str:
 
 
 def active_mutes(raw, now: float | None = None) -> dict:
-    """A mutes user valve, {id: until} in epoch seconds with 0 for always, as
+    """A mutes state field, {id: until} in epoch seconds with 0 for always, as
     the entries still in effect. Anything unreadable mutes nothing."""
     try:
         mutes = json.loads(raw) if isinstance(raw, str) else raw
@@ -200,12 +206,12 @@ def active_mutes(raw, now: float | None = None) -> dict:
 
 
 def is_muted(raw, chat_id: str, now: float | None = None) -> bool:
-    """`mutes` user valve: {chat_id: until}."""
+    """`mutes` state field: {chat_id: until}."""
     return chat_id in active_mutes(raw, now)
 
 
 def muted_folder(raw, folder_id, parent_by_id: dict, now: float | None = None):
-    """`folder_mutes` user valve: {folder_id: until}. The muted folder that
+    """`folder_mutes` state field: {folder_id: until}. The muted folder that
     holds `folder_id` (itself or a folder above it), or None."""
     mutes = active_mutes(raw, now)
     seen = set()
@@ -232,6 +238,24 @@ def subject_problem(v: str) -> str:
     if host == LOCAL_HOST or host.endswith(LOCAL_HOST_SUFFIXES) or LABEL_DOT not in host:
         return "must name a public host (Apple refuses localhost, .local and bare names)"
     return ""
+
+
+def state_key(fid: str) -> str:
+    return STATE_KEY_PREFIX + fid
+
+
+def merge_state(settings, legacy, fid: str) -> dict:
+    """The function's state for one user: its key in the user's settings over what 0.6.0 kept in its user
+    valves, field by field, so a device that has not written since the update still counts."""
+    own = (settings or {}).get(state_key(fid))
+    return {**(legacy if isinstance(legacy, dict) else {}), **(own if isinstance(own, dict) else {})}
+
+
+def settings_dict(user) -> dict:
+    raw = getattr(user, "settings", None) if user else None
+    if raw is None:
+        return {}
+    return raw.model_dump() if hasattr(raw, "model_dump") else dict(raw)
 
 
 def parse_subscriptions(raw) -> list:
@@ -296,6 +320,11 @@ class Event:
                         "in the notification. 0: off, the body says 'New reply'. The text shows on "
                         "the lock screen and in the notification shade of every subscribed device.")
 
+        SWIPE_READ: bool = Field(
+            default=True,
+            description="A notification swiped away marks its chat read (Android Chrome; 'Clear all' marks "
+                        "every chat in it read). Off: a swipe only hides it, for every user.")
+
         @field_validator("VAPID_SUBJECT")
         @classmethod
         def _usable_subject(cls, v: str) -> str:
@@ -304,31 +333,6 @@ class Event:
             if v and (problem := subject_problem(v)):
                 raise ValueError(f"VAPID_SUBJECT {problem} (for example mailto:admin@example.com), not {v!r}")
             return v
-
-    class UserValves(BaseModel):
-        subscriptions: str = Field(
-            default="[]",
-            description="Written by the page script: one Web Push subscription per device.")
-        mutes: str = Field(
-            default="{}",
-            description="Written by the page script and the service worker: chats that send no "
-                        "notification, {chat_id: until} in epoch seconds, 0 for always.")
-        folder_mutes: str = Field(
-            default="{}",
-            description="Written by the page script: folders whose chats send no notification, "
-                        "folders inside them included, {folder_id: until} as in mutes.")
-        swipe_read: bool = Field(
-            default=True,
-            description="A notification swiped away marks its chat read (Android Chrome; "
-                        "'Clear all' marks every chat in it read). Off: a swipe only hides it.")
-        gone: str = Field(
-            default="[]",
-            description="Written by the function: fingerprints of this user's subscriptions the push "
-                        "service says are gone. The page replaces such a subscription. Not set by hand.")
-        push_problem: str = Field(
-            default="",
-            description="Written by the function: why it cannot send your notifications (empty: it "
-                        "can). The page shows it. Not set by hand.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -346,17 +350,17 @@ class Event:
         from open_webui.models.functions import Functions
 
         fid = __id__ or "openclaw_web_push"
-        valves = await Functions.get_user_valves_by_id_and_user_id(fid, user_id) or {}
-        subs = parse_subscriptions(valves.get("subscriptions"))
+        state = await self._state(Functions, fid, user_id)
+        subs = parse_subscriptions(state.get("subscriptions"))
         if not subs:
             return
         chat_id = str(data.get("chat_id") or "")
         # Before anything is encrypted or sent: a muted chat sends nothing, to any device.
-        if is_muted(valves.get("mutes"), chat_id):
+        if is_muted(state.get("mutes"), chat_id):
             log.info("web push: chat is muted, nothing sent chat_id=%s", chat_id)
             return
         chat = await self._chat(chat_id)
-        folder = await self._muted_folder(valves.get("folder_mutes"), chat, user_id)
+        folder = await self._muted_folder(state.get("folder_mutes"), chat, user_id)
         if folder:
             log.info("web push: folder %s is muted, nothing sent chat_id=%s", folder[:8], chat_id)
             return
@@ -366,14 +370,14 @@ class Event:
         subject = await self._subject()
         # Said where the user sees it (the page shows push_problem), and cleared once it can send.
         problem = "" if subject else NO_SUBJECT
-        if (valves.get("push_problem") or "") != problem:
-            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {**valves, "push_problem": problem})
+        if (state.get("push_problem") or "") != problem:
+            await self._write_state(Functions, fid, user_id, {"push_problem": problem})
         if not subject:
             log.info("web push: no VAPID subject, nothing sent chat_id=%s", chat_id)
             return
         body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
                                             parse_actions(self.valves.NOTIFICATION_ACTIONS),
-                                            swipe_read=is_on(valves.get("swipe_read"), True),
+                                            swipe_read=self.valves.SWIPE_READ and is_on(state.get("swipe_read"), True),
                                             icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE,
                                             open_chat=await self._side_chat_parent(chat, user_id)))
         early = []
@@ -385,6 +389,23 @@ class Event:
             task = asyncio.create_task(self._resend(early, body, topic_for(chat_id), key, subject, chat_id))
             self._pending.add(task)   # held until done: the loop keeps only weak references
             task.add_done_callback(self._pending.discard)
+
+    @staticmethod
+    async def _state(Functions, fid: str, user_id: str) -> dict:
+        """The user's state: their settings' key for this function over the 0.6.0 user valves. A failed read
+        raises: the caller sends nothing rather than act on, or write over, a state it could not read."""
+        from open_webui.models.users import Users
+
+        legacy = await Functions.get_user_valves_by_id_and_user_id(fid, user_id)
+        return merge_state(settings_dict(await Users.get_user_by_id(user_id)), legacy, fid)
+
+    async def _write_state(self, Functions, fid: str, user_id: str, change: dict) -> None:
+        """Read the state again, change these fields, write it under its key. The first write copies every
+        field of the 0.6.0 user valves along (the migration); nothing else in the user's settings is sent."""
+        from open_webui.models.users import Users
+
+        state = await self._state(Functions, fid, user_id)
+        await Users.update_user_settings_by_id(user_id, {state_key(fid): {**state, **change}})
 
     async def _resend(self, subs: list, body: str, topic: str, key: bytes, subject: str, chat_id: str) -> None:
         """Once, when the youngest of these just-saved subscriptions is NEW_TOKEN_SETTLE_S old. A second
@@ -504,14 +525,14 @@ class Event:
 
     async def _drop(self, Functions, fid: str, user_id: str, gone: set) -> None:
         # Read again: a device may have saved its subscription meanwhile.
-        valves = await Functions.get_user_valves_by_id_and_user_id(fid, user_id) or {}
-        subs = parse_subscriptions(valves.get("subscriptions"))
+        state = await self._state(Functions, fid, user_id)
+        subs = parse_subscriptions(state.get("subscriptions"))
         keep = [s for s in subs if s["endpoint"] not in gone]
-        prints = parse_list(valves.get("gone"))
+        prints = parse_list(state.get("gone"))
         new = [fingerprint(e) for e in sorted(gone) if fingerprint(e) not in prints]
         if len(keep) != len(subs) or new:
-            await Functions.update_user_valves_by_id_and_user_id(fid, user_id, {
-                **valves, "subscriptions": json.dumps(keep), "gone": json.dumps((prints + new)[-GONE_KEEP:])})
+            await self._write_state(Functions, fid, user_id, {
+                "subscriptions": json.dumps(keep), "gone": json.dumps((prints + new)[-GONE_KEEP:])})
 
 
 def fingerprint(endpoint: str) -> str:

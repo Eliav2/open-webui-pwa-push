@@ -165,7 +165,7 @@ Open WebUI's own `chat.finished` fires when the chat request ends. For OpenClaw 
 
 ### Enable notifications
 
-While the browser has not been asked yet, an **Enable notifications** pill shows at the top of the page. Click it and allow notifications in the browser's prompt. The × hides the pill for good on that device. Each device is saved in its user's own list (the function's `subscriptions` user valve), so two people on one Open WebUI each get their own notifications. With push off (the minimal install) the pill never shows.
+While the browser has not been asked yet, an **Enable notifications** pill shows at the top of the page. Click it and allow notifications in the browser's prompt. The × hides the pill for good on that device. Each device is saved in its user's own list (the function's `subscriptions` state, see [Where the state is kept](#where-the-state-is-kept)), so two people on one Open WebUI each get their own notifications. With push off (the minimal install) the pill never shows.
 
 <p align="center">
   <img src="./docs/img/enable.png" alt="Open WebUI on a phone with an 'Enable notifications' pill and a × at the top of the page" width="220">
@@ -208,7 +208,7 @@ If the reply cannot be sent (signed out, the session expired, offline, the chat'
 
 ### Mute a chat
 
-In a chat, a bell in Open WebUI's header shows whether the chat notifies. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**; a muted chat's bell is crossed out and its menu says until when. The same menu opens from **Mute notifications** in the chat's ⋯ menu in the sidebar, and **Mute 8 h** can be a notification button ([`NOTIFICATION_ACTIONS`](#settings)). A mute is kept on the server (the function's `mutes` user valve), so it applies to every device of yours; it is per user, so muting a shared chat mutes it only for you. The bell and the menu item show once a device of yours is enabled.
+In a chat, a bell in Open WebUI's header shows whether the chat notifies. Click it for **Mute for 1 hour**, **Mute for 8 hours**, **Mute always** or **Unmute**; a muted chat's bell is crossed out and its menu says until when. The same menu opens from **Mute notifications** in the chat's ⋯ menu in the sidebar, and **Mute 8 h** can be a notification button ([`NOTIFICATION_ACTIONS`](#settings)). A mute is kept on the server (the function's `mutes` state), so it applies to every device of yours; it is per user, so muting a shared chat mutes it only for you. The bell and the menu item show once a device of yours is enabled.
 
 <p align="center">
   <img src="./docs/img/bell.png" alt="The bell's menu in a chat: notifications on, Mute for 1 hour, for 8 hours, always" width="220">
@@ -217,7 +217,7 @@ In a chat, a bell in Open WebUI's header shows whether the chat notifies. Click 
 
 ### Mute a folder
 
-In a chat that is in a folder, the bell's menu has a second part for the folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's own ⋯ menu has **Mute folder** after Open WebUI's "Mark all as read". A folder's mute covers the chats in it and in every folder inside it, so a folder of automated chats can stay quiet while your own chats notify. Folder mutes are kept like chat mutes (the `folder_mutes` user valve).
+In a chat that is in a folder, the bell's menu has a second part for the folder: **Mute folder for 1 hour**, **for 8 hours**, **always**, or **Unmute folder**. A folder's own ⋯ menu has **Mute folder** after Open WebUI's "Mark all as read". A folder's mute covers the chats in it and in every folder inside it, so a folder of automated chats can stay quiet while your own chats notify. Folder mutes are kept like chat mutes (the `folder_mutes` state).
 
 <p align="center">
   <img src="./docs/img/bell-folder.png" alt="The bell's menu in a chat in the Travel folder: the chat's mute choices, then Mute folder for 1 hour, 8 hours, always" width="220">
@@ -260,6 +260,8 @@ In a Safari tab nothing of this runs (the page script stops at once there): no n
 
 A change of network while Open WebUI loads (Wi-Fi to mobile) can fail one of its files, and Open WebUI then shows "500 Internal Error" for good, or stays half drawn. The page script asks a failed start read once more on the new network, and reloads the app once when the server can be reached again. This works with offline open on or off, and with push off.
 
+With offline open on, a change can leave no connection for a moment (Wi-Fi off, mobile data not up yet): the service worker's two asks, at once, both fail, and Open WebUI went to its `/error` page ("Backend Required"), which never recovers. The page script now holds that read until the next `online` or network change and asks it once more. It waits only when the browser reports no network, or a change came while the read was on its way; a read that failed on a network that is up and did not change (the server is down) fails as before.
+
 ## Settings
 
 The function's valves, in **Admin Panel > Functions > Web Push > Valves** (the gear):
@@ -280,9 +282,11 @@ The function's valves, in **Admin Panel > Functions > Web Push > Valves** (the g
 
 ### Your own settings
 
-Each user's own valves of the function are in a chat's **Controls** (the sliders icon by the model) **> Valves > Functions > Web Push**. `subscriptions`, `mutes` and `folder_mutes` are written by the page script and the service worker, not by hand. `swipe_read` (on by default) is yours: off, a swiped notification only hides.
+`SWIPE_READ` (on by default, an admin valve for every user): off, a swiped notification only hides.
 
-<p align="center"><img src="./docs/img/user-valves.png" alt="A chat's Controls panel, Valves, Functions, Web Push: the user's own valves, Swipe Read among them" width="640"></p>
+#### Where the state is kept
+
+The function has no user valves. Each user's devices, mutes and the like (`subscriptions`, `mutes`, `folder_mutes`, `gone`, `push_problem`) are one key, `web_push:<function id>`, in the user's own Open WebUI settings, which no Open WebUI page shows. They were user valves up to 0.6.0, and a function with user valves gets a second valves button in the chat composer and an entry in the Controls panel whose save could write stale values over the devices and mutes (ELI-442). Updating needs nothing from you: what 0.6.0 stored is read under the new key, field by field, and every field is carried over by the first write (a mute, a device saved, or a notification that finds a push problem). A failed read of the old values fails that write instead of replacing them.
 
 ## How it behaves
 
@@ -313,7 +317,7 @@ Only `GET` requests to your own Open WebUI; everything else goes straight to the
 
 ## Known limits
 
-- **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your user valves and write them all back, because Open WebUI's user-valve update replaces the whole set. Two writers at once (two devices, two tabs) can put back the other's old value. If a mute did not stick, change it again.
+- **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your state and write it all back as one key. Two writers at once (two devices, two tabs) can put back the other's old value. If a mute did not stick, change it again.
 - **Open WebUI 0.13.0's pages.** The menu items are found by the structure and icons of Open WebUI 0.13.0's menus, not by their text (they are translated). A later version that draws them differently gets no items, and the console says once which menu it did not recognise. `e2e/` checks this contract against the pinned version. The same holds for the side chat's panel: the navbar's Tabs button (its one button with `aria-expanded` and no menu) and a tab's `chat-panel-<id>` element. A version that draws them differently still opens the parent chat, but not its sheet.
 - **Safari tabs** get nothing ([iPhone and iPad](#iphone-and-ipad)).
 - **A push the push service accepted is its to deliver.** If the device's own connection to it is not up yet (seen once on a freshly reset Android Chrome), the notification comes late or not at all; the function is not told and sends nothing again.

@@ -282,32 +282,9 @@ def shot_admin(pw, token, ids, folders):
     ctx.close()
 
 
-def shot_user_valves(pw, token, ids, folders):
-    """Each user's own valves of the function, in a chat's Controls: Swipe Read among them."""
-    ctx, page = browser(pw, token, DESKTOP)
-    opened(page, ids["Weekly groceries"])
-    page.get_by_role("button", name="Model controls").click()
-    page.get_by_text("Valves", exact=True).first.click()
-    selects = page.locator("select")
-    selects.nth(0).select_option(label="Functions")
-    selects.nth(1).select_option(label="Web Push")
-    swipe = page.get_by_text("Swipe Read", exact=True)
-    swipe.wait_for(timeout=WAIT_MS)
-    # The row in the middle of the Controls panel's own scroll box, once the panel has opened (during
-    # its transition nothing in it scrolls yet).
-    page.wait_for_timeout(e2e.MENU_DRAWN_WAIT_MS)
-    swipe.evaluate("""(e) => {
-        let box = e.parentElement;
-        while (box && !(box.scrollHeight > box.clientHeight && /auto|scroll/.test(getComputedStyle(box).overflowY))) box = box.parentElement;
-        if (box) box.scrollTop += e.getBoundingClientRect().top - box.getBoundingClientRect().top - box.clientHeight / 2;
-    }""")
-    save(page, "user-valves")
-    ctx.close()
-
-
 SHOTS = {f.__name__[len("shot_"):].replace("_", "-"): f for f in (
     shot_enable, shot_bell, shot_bell_folder, shot_muted, shot_chat_menu, shot_folder_menu, shot_reply_unsent,
-    shot_offline, shot_updating, shot_admin, shot_user_valves)}
+    shot_offline, shot_updating, shot_admin)}
 
 
 def main():
