@@ -44,9 +44,21 @@ function worker({ site = {} } = {}) {
   }
   // The server: `site` answers its paths (a function per path), anything else gets a token.
   const fetched = [];
-  const fetch = async (url) => {
+  // Open WebUI's state API: every call recorded; the user's settings and the function's 0.6.0 user valves
+  // answer from `server` (a test sets them). Open WebUI 0.13's settings update replaces only the keys it is sent.
+  const calls = [];
+  const server = { settings: {}, legacyValves: null, legacyStatus: 200 };
+  const fetch = async (url, init = {}) => {
     const path = new URL(url, "https://chat.example").pathname;
     fetched.push(path);
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ path, method: init.method || "GET", body });
+    if (path === "/api/v1/users/user/settings") return new Response(JSON.stringify(server.settings), { status: 200 });
+    if (path === "/api/v1/users/user/settings/update") {
+      Object.assign(server.settings, body);
+      return new Response(JSON.stringify(server.settings), { status: 200 });
+    }
+    if (/\/valves\/user$/.test(path)) return new Response(JSON.stringify(server.legacyValves), { status: server.legacyStatus });
     return site[path] ? site[path]() : new Response(JSON.stringify({ token: "t" }), { status: 200 });
   };
   const registration = {
@@ -80,7 +92,7 @@ function worker({ site = {} } = {}) {
   }
   // A swipe: Android removes the notification, then Chrome fires notificationclose.
   const swipe = (n) => { n.close(); return fire("notificationclose", n); };
-  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches, fetched };
+  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches, fetched, calls, server };
 }
 
 const reply = (chat, body, title = "Trip plan") => ({ chat_id: chat, title, body, url: "/c/" + chat });
@@ -202,7 +214,7 @@ test("a swiped notification marks its chat read (once, however many replies it s
   assert.deepEqual(w.reads, ["a"]);
 });
 
-test("swipe_read off (the user's valve): a swipe only hides it", async () => {
+test("swipe_read off (the admin's valve): a swipe only hides it", async () => {
   const w = worker();
   await w.push({ ...reply("a", "one"), swipe_read: false });
   await w.swipe(w.tag("a"));
@@ -255,4 +267,28 @@ test("a swipe, then the chat's next notification before the worker handles the c
   await w.push(reply("a", "two"));     // the next reply's notification, first
   await w.fire("notificationclose", swiped);
   assert.deepEqual(w.reads, ["a"]);
+});
+
+test("Mute writes the function's state in the user's settings, never its user valves (ELI-442)", async () => {
+  const w = worker();
+  w.server.settings = { ui: { theme: "dark" }, "web_push:fn1": { subscriptions: "[{\"endpoint\":\"e1\"}]", mutes: "{}" } };
+  w.server.legacyValves = { folder_mutes: "{\"f1\":0}", mutes: "{\"old\":0}" };
+  await w.push({ ...reply("a", "one"), fn: "fn1", actions: ["mute"] });
+  await w.fire("notificationclick", w.tag("a"), { action: "mute" });
+  assert.ok(!w.calls.some((c) => c.method === "POST" && /valves/.test(c.path)), "no write to user valves");
+  const state = w.server.settings["web_push:fn1"];
+  assert.ok(JSON.parse(state.mutes).a > 0, "the chat is muted");
+  assert.equal(state.subscriptions, "[{\"endpoint\":\"e1\"}]", "the devices are kept");
+  assert.equal(state.folder_mutes, "{\"f1\":0}", "a field only the 0.6.0 user valves had is carried over");
+  assert.deepEqual(w.server.settings.ui, { theme: "dark" }, "the rest of the settings is untouched");
+});
+
+test("Mute writes nothing when the old user valves cannot be read (they may hold the devices)", async () => {
+  const w = worker();
+  w.server.legacyValves = { subscriptions: "[{\"endpoint\":\"e1\"}]" };
+  w.server.legacyStatus = 503;
+  await w.push({ ...reply("a", "one"), fn: "fn1", actions: ["mute"] });
+  await w.fire("notificationclick", w.tag("a"), { action: "mute" });
+  assert.ok(!w.calls.some((c) => c.method === "POST" && /settings\/update/.test(c.path)),
+    "a write with the devices missing would wipe them");
 });

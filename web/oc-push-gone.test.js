@@ -1,6 +1,6 @@
 // node --test web/oc-push-gone.test.js: a push service can retire a subscription the browser still holds
 // (Chrome keeps listing it, no pushsubscriptionchange). The function then remembers it by fingerprint in the
-// user's `gone` valve (openclaw_web_push.py). On the next load the page replaces it with a new subscription
+// user's `gone` state (openclaw_web_push.py). On the next load the page replaces it with a new subscription
 // instead of saving the dead one again.
 import test from "node:test";
 import assert from "node:assert";
@@ -14,7 +14,11 @@ const FINGERPRINT_CHARS = 32;   // openclaw_web_push.py
 const fingerprint = (e) => crypto.createHash("sha256").update(e).digest("hex").slice(0, FINGERPRINT_CHARS);
 const OLD = "https://fcm.example/send/retired", NEW = "https://fcm.example/send/fresh";
 
-function page(valves) {
+const STATE = "web_push:web_push";   // the function's state in the user's settings (ELI-442)
+
+// `state`: what the settings hold under STATE; `legacy`: what 0.6.0 kept in the user valves (null: no record).
+function page(state, legacy = null) {
+  const settings = { ui: { theme: "dark" }, [STATE]: state };
   const local = new Map([["token", "user-token"], ["ocPushUser", "u1"], ["ocPushDevice", "dev1"]]);
   const writes = [], unsubscribed = [];
   const keyBytes = Uint8Array.from(Buffer.from(VAPID, "base64url"));
@@ -30,8 +34,15 @@ function page(valves) {
   };
   const fetch = async (url, init = {}) => {
     const u = String(url);
-    if (u.endsWith("/valves/user/update")) { writes.push(JSON.parse(init.body)); valves = JSON.parse(init.body); return new Response("{}"); }
-    if (u.endsWith("/valves/user")) return new Response(JSON.stringify(valves));
+    if (u.endsWith("/users/user/settings/update")) {
+      const body = JSON.parse(init.body);
+      writes.push(body[STATE]);
+      Object.assign(settings, body);
+      return new Response(JSON.stringify(settings));
+    }
+    if (u.endsWith("/users/user/settings")) return new Response(JSON.stringify(settings));
+    if (u.endsWith("/valves/user")) return new Response(JSON.stringify(legacy));
+    if (u.includes("/valves/user/")) throw new Error("the user valves are not written any more: " + u);
     if (u.endsWith("/api/v1/auths/")) return new Response(JSON.stringify({ id: "u1" }));
     return new Response("{}");
   };
@@ -92,4 +103,12 @@ test("at most one replacement per load: a new subscription also gone waits for t
   assert.equal(p.subscribes, 1);
   assert.deepEqual(p.unsubscribed, [OLD]);
   assert.deepEqual(saved(p.writes), [], "neither dead one saved");
+});
+
+test("the state of 0.6.0 (user valves, nothing under the new key yet) is read, and the write carries it over", async () => {
+  const p = page(undefined, { subscriptions: "[]", mutes: "{\"c9\":0}", gone: JSON.stringify([fingerprint(OLD)]) });
+  assert.equal(await p.sandbox.ocPushReady, "saved");
+  assert.deepEqual(p.unsubscribed, [OLD], "the old valves' gone list is honoured");
+  assert.deepEqual(saved(p.writes), [NEW]);
+  assert.equal(p.writes.at(-1).mutes, "{\"c9\":0}", "a field only the old valves had is carried over");
 });

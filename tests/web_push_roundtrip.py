@@ -75,13 +75,17 @@ def main(scenario: str) -> None:
     class Functions:
         @staticmethod
         async def get_user_valves_by_id_and_user_id(fid, user_id):
-            return dict(store) if (fid, user_id) == ("web_push", "u1") else None
+            return None   # nothing left in the user valves: the state is in the user's settings
+
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            return types.SimpleNamespace(settings={"web_push:web_push": dict(store)}) if user_id == "u1" else None
 
         @staticmethod
-        async def update_user_valves_by_id_and_user_id(fid, user_id, valves):
+        async def update_user_settings_by_id(user_id, updated):
             store.clear()
-            store.update(valves)
-            return valves
+            store.update(updated["web_push:web_push"])
 
     class Chats:
         @staticmethod
@@ -90,6 +94,7 @@ def main(scenario: str) -> None:
 
     for name, attrs in (("open_webui", {}), ("open_webui.models", {}),
                         ("open_webui.models.functions", {"Functions": Functions}),
+                        ("open_webui.models.users", {"Users": Users}),
                         ("open_webui.models.chats", {"Chats": Chats})):
         sys.modules[name] = types.ModuleType(name)
         sys.modules[name].__dict__.update(attrs)

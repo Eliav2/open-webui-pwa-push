@@ -6,7 +6,7 @@
 // Left empty (or not replaced), push is off: the service worker only (offline
 // open, kept chats), with no "Enable notifications", bell or mute items.
 // It registers /oc-sw.js and keeps this device's push subscription in that
-// function's user valves, through Open WebUI's own API with the user's token.
+// function's state (the user's Open WebUI settings), through Open WebUI's own API with the user's token.
 // In a chat it adds a bell (mute this chat for every device of the user) and
 // puts a reply that could not be sent from a notification into the message box.
 (() => {
@@ -44,14 +44,21 @@
     headers: { Authorization: "Bearer " + store.get("token"), "Content-Type": "application/json", [OWN_READ]: own },
     body: body ? JSON.stringify(body) : undefined,
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(path + " " + r.status))));
-  const valves = (suffix, body) => call("/api/v1/functions/id/" + FN + "/valves/user" + suffix, body);
-  // Open WebUI's update replaces every user valve: read them all right before
-  // the write and change one. Two devices writing at the same moment can still
-  // lose one write; the next write of either heals it.
-  async function updateValves(change) {
-    const now = (await valves("")) || {};
+  // The function's state (devices, mutes) is in the user's Open WebUI settings under its own key, not in its
+  // user valves (ELI-442). Open WebUI 0.13's settings update replaces only the top-level keys it is sent. What
+  // 0.6.0 kept in the user valves is read under it, field by field, so it carries over on the first write. A failed
+  // read of those fails the write too: they may hold the only copy of the devices (no record: null).
+  const STATE_KEY_PREFIX = "web_push:", SETTINGS = "/api/v1/users/user/settings";
+  async function loadState() {
+    const [settings, legacy] = await Promise.all([call(SETTINGS), call("/api/v1/functions/id/" + FN + "/valves/user")]);
+    return { ...(legacy || {}), ...(settings?.[STATE_KEY_PREFIX + FN] || {}) };
+  }
+  // Read the state right before the write and change some fields. Two devices writing at the same moment can
+  // still lose one write; the next write of either heals it.
+  async function updateState(change) {
+    const now = await loadState();
     const next = { ...now, ...change(now) };
-    await valves("/update", next);
+    await call(SETTINGS + "/update", { [STATE_KEY_PREFIX + FN]: next });
     return next;
   }
   const parse = (raw, empty) => { try { return JSON.parse(raw || empty) || JSON.parse(empty); } catch (_) { return JSON.parse(empty); } };
@@ -69,7 +76,7 @@
     let result = "kept";
     let device = store.get("ocPushDevice");
     if (!device) { device = crypto.randomUUID(); store.set("ocPushDevice", device); }
-    await updateValves((now) => {
+    await updateState((now) => {
       if (parse(now.gone, "[]").includes(print)) { result = GONE; return {}; }
       let list = parse(now.subscriptions, "[]");
       if (list.some((x) => x.endpoint === s.endpoint)) return {};
@@ -349,7 +356,7 @@
   // --- In a chat: the mute bell, and a reply that came back from a notification.
 
   const VISIBLE = "visible";
-  // The two mute lists in the function's user valves, {id: until} (0 always):
+  // The two mute lists in the function's state, {id: until} (0 always):
   // chats, and folders (a folder's mute covers the folders inside it).
   const CHATS = "mutes", FOLDERS = "folder_mutes";
   const HOUR_S = 3600;
@@ -375,8 +382,7 @@
   // share the one read on its way instead of each asking the server.
   let loadingMutes = null, problemShown = "";
   function loadMutes() {
-    return loadingMutes ||= valves("").then((v) => {
-      v ||= {};
+    return loadingMutes ||= loadState().then((v) => {
       mutes = { [CHATS]: parse(v[CHATS], "{}"), [FOLDERS]: parse(v[FOLDERS], "{}") };
       hasDevices = parse(v.subscriptions, "[]").length > 0;
       // The function could not send this user's notifications (openclaw_web_push.py
@@ -398,7 +404,7 @@
 
   // seconds: 0 always, null unmute.
   async function setMute(list, id, seconds) {
-    const next = await updateValves((now) => {
+    const next = await updateState((now) => {
       const m = parse(now[list], "{}");
       const nowS = Math.floor(Date.now() / 1000);
       for (const k of Object.keys(m)) if (m[k] !== 0 && m[k] <= nowS) delete m[k];   // expired
@@ -1501,16 +1507,23 @@
   navigator.serviceWorker?.controller?.postMessage({ type: "oc-version-check" });
 })();
 
-// --- Open WebUI's start reads after a network change (ELI-362). A change of
+// --- Open WebUI's start reads after a network change (ELI-362, ELI-374). A change of
 // network fails every request on its way (ERR_NETWORK_CHANGED), and Open WebUI
 // asks its start reads (config, user, settings, models, the chat list, the chat)
-// only once: one that fails leaves the app half drawn for good, with no error
-// page to recover from. A start read that fails on the network (no answer, not an
-// HTTP error) is asked once more at once, on the new network. With offline open
-// on, the service worker already does the same (oc-sw.js again()), and its failure
-// is final: the page does not ask a third and fourth time. This covers offline open
-// off (or no worker yet), where the worker answers nothing itself. Only these
-// reads, only GET, and only once each.
+// only once: one that fails leaves the app half drawn for good, or sends it to
+// /error ("Backend Required"), a page that never recovers. A start read that
+// fails on the network (no answer, not an HTTP error) is asked once more.
+//   - No worker keeping the app: at once, on the new network.
+//   - A worker keeping the app (offline open on) has already asked twice, at once
+//     (oc-sw.js again()), and both asks can fall in the same dead moment between
+//     the old network and the new one: a Wi-Fi switch that leaves no connection
+//     for a second (ELI-374: /api/config answered Response.error() and the app
+//     stopped at /error). A page cannot read the network from a timer, so the
+//     read waits for the signal: the next 'online' or network change, then is asked
+//     once more. It waits only when the network is gone (navigator.onLine false)
+//     or changed while the read was on its way; a read that failed on a network
+//     that is up and did not change (the server is down) goes to Open WebUI as ever.
+// Only these reads, only GET, and the one ask after the failure each.
 (() => {
   const START_READS = [
     /^\/api\/config$/, /^\/api\/version$/, /^\/api\/models$/, /^\/api\/v1\/auths\/$/,
@@ -1530,14 +1543,38 @@
   // worker drops every cache when it starts.
   const KEPT_APP = "oc-shell-v1";   // oc-sw.js SHELL
   const workerRetried = async () => !!navigator.serviceWorker?.controller && !!(await globalThis.caches?.has(KEPT_APP));
+  // The network signals: how many have come, and who waits for the next one.
+  let signals = 0;
+  const waiting = new Set();
+  const signal = () => {
+    signals += 1;
+    for (const release of [...waiting]) release();
+  };
+  addEventListener("online", signal);
+  navigator.connection?.addEventListener?.("change", signal);
+  // Resolves on the next network signal; rejects when Open WebUI cancels the read meanwhile.
+  const nextSignal = (cancel) => new Promise((resolve, reject) => {
+    const done = () => { waiting.delete(done); cancel?.removeEventListener?.("abort", stop); resolve(); };
+    const stop = () => { waiting.delete(done); reject(cancel.reason ?? new DOMException("Aborted", "AbortError")); };
+    waiting.add(done);
+    cancel?.addEventListener?.("abort", stop);
+  });
   const original = window.fetch;
   window.fetch = function (input, init) {
     if (!startRead(input, init)) return original.call(this, input, init);
     // A Request's body is used once: the second attempt gets a fresh copy.
     const again = input instanceof Request ? input.clone() : input;
+    const cancel = init?.signal || (input instanceof Request ? input.signal : undefined);
+    const seen = signals;
     return original.call(this, input, init).catch(async (e) => {
-      if (init?.signal?.aborted || (input instanceof Request && input.signal.aborted)) throw e;   // Open WebUI cancelled it
-      if (await workerRetried()) throw e;
+      if (cancel?.aborted) throw e;   // Open WebUI cancelled it
+      if (await workerRetried()) {
+        // Asked twice at once already: ask again on the next signal, if the network is gone or moved.
+        if (signals === seen) {
+          if (navigator.onLine !== false) throw e;
+          await nextSignal(cancel);
+        }
+      }
       return original.call(this, again, init);
     });
   };

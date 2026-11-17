@@ -1,5 +1,5 @@
 // node --test web/oc-push-problem.test.js: the function could not send this user's notifications
-// (openclaw_web_push.py writes why into the user's push_problem valve, e.g. no usable VAPID subject).
+// (openclaw_web_push.py writes why into the user's push_problem state, e.g. no usable VAPID subject).
 // The page says so where the user sees it, and the line stays until it is tapped.
 import test from "node:test";
 import assert from "node:assert";
@@ -11,7 +11,7 @@ const CHAT = "12345678";
 const PROBLEM = "Notifications can't be sent yet: the admin must set VAPID_SUBJECT.";
 const DEVICE = JSON.stringify([{ endpoint: "https://push.example/1", keys: {} }]);
 
-function page(userValves) {
+function page(state, legacy = null) {
   const local = new Map([["token", "user-token"]]), session = new Map(), shown = [], timers = [];
   const location = {
     pathname: "/c/" + CHAT, search: "", hash: "", origin: "https://chat.example",
@@ -28,7 +28,13 @@ function page(userValves) {
     };
     return el;
   };
-  const fetch = async (url) => new Response(JSON.stringify(String(url).includes("/valves/user") ? userValves : {}), { status: 200 });
+  // The function's state is in the user's settings (ELI-442); `legacy` is what 0.6.0 kept in the user valves.
+  const answer = (url) => {
+    const u = String(url);
+    if (u.endsWith("/users/user/settings")) return { ui: {}, "web_push:web_push": state };
+    return u.endsWith("/valves/user") ? legacy : {};
+  };
+  const fetch = async (url) => new Response(JSON.stringify(answer(url)), { status: 200 });
   const sandbox = {
     navigator: {
       userAgent: "Mozilla/5.0 (Linux; Android 14) Chrome/140", onLine: true, maxTouchPoints: 5,
@@ -84,4 +90,11 @@ test("no problem, or no device on this account: no line", async () => {
     await settle();
     assert.deepEqual(p.notices(), [], JSON.stringify(v));
   }
+});
+
+test("a problem the 0.6.0 user valves still hold is said as well", async () => {
+  const p = page(undefined, { subscriptions: DEVICE, push_problem: PROBLEM });
+  await p.sandbox.ocPushReady;
+  await settle();
+  assert.equal(p.notices().length, 1);
 });

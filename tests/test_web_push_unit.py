@@ -22,6 +22,7 @@ web_push = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(web_push)
 
 REPLY = "SECRET-REPLY-TEXT the whole answer the agent wrote"
+STATE_KEY = "web_push:web_push"   # where the function's state is in a user's settings, for the id the tests send
 PIPE = ["openclaw_gateway."]
 
 
@@ -129,7 +130,7 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(web_push.parse_actions(""), [])
 
     def test_mute_needs_the_function_id(self):
-        """Mute writes this function's user valves: without its id, no Mute button."""
+        """Mute writes this function's state: without its id, no Mute button."""
         self.assertEqual(web_push.build_payload(finished(), actions=["reply", "mute", "read"])["actions"], ["reply", "read"])
 
     def test_no_chat_no_buttons(self):
@@ -180,14 +181,36 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
                                                     "keys": {"p256dh": "k", "auth": "a"}}])}
         store = self.store
 
+        # What 0.6.0 kept in the user valves (empty unless a test sets it), and the user's Open WebUI settings,
+        # where the function's state lives under STATE_KEY. `self.store` is that state (updated in place).
+        self.legacy = {}
+        legacy = self.legacy
+        self.settings = {"theme": "dark", STATE_KEY: store}
+        settings = self.settings
+
         class Functions:
             @staticmethod
             async def get_user_valves_by_id_and_user_id(fid, user_id):
-                return dict(store)
+                return dict(legacy) if legacy else None
 
             @staticmethod
             async def update_user_valves_by_id_and_user_id(fid, user_id, valves):
-                store.update(valves)
+                raise AssertionError("the user valves are not written any more (ELI-442)")
+
+        class Users:
+            @staticmethod
+            async def get_user_by_id(user_id):
+                return types.SimpleNamespace(settings=types.SimpleNamespace(model_dump=lambda: dict(settings)))
+
+            @staticmethod
+            async def update_user_settings_by_id(user_id, updated):
+                # Open WebUI 0.13: only the top-level keys it is sent are replaced.
+                for key, value in updated.items():
+                    if key == STATE_KEY:
+                        store.clear()
+                        store.update(value)
+                    else:
+                        settings[key] = value
         # c1 is in folder "qa-old", inside "qa".
         self.folder_reads = []
         reads = self.folder_reads
@@ -219,12 +242,14 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
                 return [types.SimpleNamespace(id="qa", parent_id=None), types.SimpleNamespace(id="qa-old", parent_id="qa")]
         mods = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
                 "open_webui.models.functions": types.ModuleType("open_webui.models.functions"),
+                "open_webui.models.users": types.ModuleType("open_webui.models.users"),
                 "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
                 "open_webui.models.folders": types.ModuleType("open_webui.models.folders"),
                 "open_webui.models.chat_views": types.ModuleType("open_webui.models.chat_views"),
                 "open_webui.internal": types.ModuleType("open_webui.internal"),
                 "open_webui.internal.db": types.ModuleType("open_webui.internal.db")}
         mods["open_webui.models.functions"].Functions = Functions
+        mods["open_webui.models.users"].Users = Users
         mods["open_webui.models.chats"].Chats = Chats
         mods["open_webui.models.folders"].Folders = Folders
         mods["open_webui.models.chat_views"].ChatViewStates = ChatViewStates
@@ -283,7 +308,53 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.store["swipe_read"] = True
         await self.fn.event(finished(), __id__="web_push")
         self.assertNotIn("swipe_read", json.loads(self.sent[-1][1]))
-        self.assertTrue(web_push.Event.UserValves().swipe_read)
+        self.assertTrue(web_push.Event.Valves().SWIPE_READ)
+
+    async def test_the_function_has_no_user_valves(self):
+        """ELI-442: a function with user valves gets a valves button and a Controls panel entry whose save
+        can write stale values over the subscriptions and mutes. The state is in the user's settings."""
+        self.assertFalse(hasattr(web_push.Event, "UserValves"))
+
+    async def test_the_swipe_read_valve_off_wins_over_a_users_old_on(self):
+        self.fn.valves.SWIPE_READ = False
+        self.store["swipe_read"] = True
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertIs(json.loads(self.sent[-1][1])["swipe_read"], False)
+
+    async def test_the_0_6_0_user_valves_state_is_read_and_carried_over_by_the_next_write(self):
+        """The shape 0.6.0 kept in the user valves (strings, a bool): read as the state until the first write
+        under the new key, which carries every field over, the devices and mutes included."""
+        subs = json.dumps([{"endpoint": "https://push.example/old", "keys": {"p256dh": "k", "auth": "a"}}])
+        self.legacy.update({"subscriptions": subs, "mutes": json.dumps({"c9": 0}),
+                            "folder_mutes": json.dumps({"work": 0}), "gone": json.dumps(["abc"]),
+                            "push_problem": web_push.NO_SUBJECT, "swipe_read": False})
+        self.store.clear()
+        await self.fn.event(finished(), __id__="web_push")
+        (sent_subs, body, _key, _subject), = self.sent
+        self.assertEqual(sent_subs[0]["endpoint"], "https://push.example/old")
+        self.assertIs(json.loads(body)["swipe_read"], False, "the old swipe_read off still holds")
+        # push_problem was set and can now be sent: the function writes the state, once, with the rest.
+        self.assertEqual(self.store["push_problem"], "")
+        self.assertEqual({k: self.store[k] for k in ("subscriptions", "mutes", "folder_mutes", "gone", "swipe_read")},
+                         {k: self.legacy[k] for k in ("subscriptions", "mutes", "folder_mutes", "gone", "swipe_read")})
+        self.assertEqual(self.settings["theme"], "dark", "the user's other settings are not touched")
+
+    async def test_a_mute_in_the_old_user_valves_still_holds(self):
+        self.store.clear()
+        self.legacy.update({"subscriptions": json.dumps([{"endpoint": "https://push.example/1",
+                                                          "keys": {"p256dh": "k", "auth": "a"}}]),
+                            "mutes": json.dumps({"c1": 0})})
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+
+    async def test_the_new_state_wins_over_the_old_user_valves_field_by_field(self):
+        """Unmuted since the update (the state's mutes are empty) beats the old valves' mute; a field the
+        state does not have yet (here swipe_read) still comes from the old valves."""
+        self.legacy.update({"mutes": json.dumps({"c1": 0}), "swipe_read": False})
+        self.store["mutes"] = "{}"
+        await self.fn.event(finished(), __id__="web_push")
+        (_subs, body, _key, _subject), = self.sent
+        self.assertIs(json.loads(body)["swipe_read"], False)
 
     def webui_url(self, url):
         """Open WebUI's saved WEBUI_URL as the function reads it."""
@@ -467,18 +538,40 @@ class GoneTests(unittest.IsolatedAsyncioTestCase):
     pushsubscriptionchange): the page would save that dead one again on every load. So the function
     remembers each gone endpoint by fingerprint (`gone`), and the page replaces such a subscription."""
 
-    def functions(self, valves):
+    def functions(self, valves, legacy=None):
+        """`valves`: the function's state (the user's settings, under its key); `legacy`: what 0.6.0 kept in the
+        user valves. Open WebUI's Users is stubbed as well: _drop writes the state there."""
         store = {"v": valves}
 
         class Functions:
             @staticmethod
             async def get_user_valves_by_id_and_user_id(fid, user_id):
-                return store["v"]
+                return dict(legacy) if legacy else None
+
+        class Users:
+            @staticmethod
+            async def get_user_by_id(user_id):
+                return types.SimpleNamespace(settings={"web_push:web_push": store["v"]})
 
             @staticmethod
-            async def update_user_valves_by_id_and_user_id(fid, user_id, v):
-                store["v"] = v
+            async def update_user_settings_by_id(user_id, updated):
+                store["v"] = updated["web_push:web_push"]
+        mods = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.users": types.ModuleType("open_webui.models.users")}
+        mods["open_webui.models.users"].Users = Users
+        p = mock.patch.dict(sys.modules, mods)
+        p.start()
+        self.addCleanup(p.stop)
         return Functions, store
+
+    async def test_a_drop_carries_the_old_user_valves_into_the_state(self):
+        keys = {"p256dh": "k", "auth": "a"}
+        subs = [{"endpoint": "https://push.example/dead", "keys": keys, "device": "d1"},
+                {"endpoint": "https://push.example/ok", "keys": keys, "device": "d2"}]
+        Functions, store = self.functions({}, legacy={"subscriptions": json.dumps(subs), "mutes": json.dumps({"c9": 0})})
+        await web_push.Event()._drop(Functions, "web_push", "u1", {"https://push.example/dead"})
+        self.assertEqual([s["device"] for s in json.loads(store["v"]["subscriptions"])], ["d2"])
+        self.assertEqual(store["v"]["mutes"], json.dumps({"c9": 0}), "the mute carried over from the old valves")
 
     async def test_a_gone_endpoint_is_dropped_and_its_fingerprint_kept(self):
         keys = {"p256dh": "k", "auth": "a"}
