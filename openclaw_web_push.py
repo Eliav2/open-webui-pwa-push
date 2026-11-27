@@ -2,9 +2,9 @@
 title: Web Push notifications
 author: Eliav2
 author_url: https://github.com/Eliav2/open-webui-pwa-push
-version: 0.7.0
+version: 0.8.0
 requirements: pywebpush==2.0.3
-description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing.
+description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes (the chat's title and link) and when a channel message arrives (the channel's name or the sender, and its link); the start of the text only when PREVIEW_CHARS / CHANNEL_PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing; Open WebUI's own channel mute holds channel messages.
 """
 # Docs: README.md. The page script (web/oc-push.js) keeps
 # each device's subscription in this function's state, in the user's Open WebUI
@@ -18,7 +18,7 @@ import os
 import re
 import time
 
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -27,6 +27,14 @@ log = logging.getLogger("openclaw_web_push")
 # Open WebUI's event names are a closed catalog (events.py `event_name`), so the
 # OpenClaw Pipe marks its own `chat.finished` by `source`.
 PIPE_SOURCE = "openclaw-pipe"
+CHAT_EVENT = "chat.finished"
+# Open WebUI 0.13 publishes this once per channel member who is not looking at the channel, only while its
+# `ui.enable_user_webhooks` setting is on (routers/channels.py send_notification). `data.user_id` is the
+# recipient, `data.sender_id` the author; the per-channel mute is applied there, a mention beating it.
+CHANNEL_EVENT = "channel.message"
+# A channel's id in the log and in the push topic, apart from a chat's.
+CHANNEL_ID_PREFIX = "channel:"
+CHANNEL_DEFAULT_TITLE = "New message"   # a DM whose sender is unknown
 # Push services take at most 4096 bytes per message after encryption.
 MAX_PAYLOAD_BYTES = 3000
 MAX_TITLE_CHARS = 120
@@ -95,6 +103,8 @@ _LINKS = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _TAGS = re.compile(r"<[^>]+>")
 _LINE_MARKS = re.compile(r"^\s*(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s?)", re.M)
 _INLINE_MARKS = re.compile(r"(\*\*|__|~~|`)")
+# Open WebUI's mention markup (utils/channels.py): <@U:user-id|Label>, <@M:model-id|Label>.
+_MENTION = re.compile(r"<@[A-Z]:[^|>]+(?:\|([^>]+))?>")
 
 
 def snippet(text: str, limit: int) -> str:
@@ -115,6 +125,11 @@ def snippet(text: str, limit: int) -> str:
         return t
     cut = t[:limit - 1]
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:") + "…"
+
+
+def mentions_as_text(text: str) -> str:
+    """Open WebUI's mention markup as "@Label" (nothing for one without a label)."""
+    return _MENTION.sub(lambda m: "@" + m.group(1) if m.group(1) else "", str(text or ""))
 
 
 def is_on(raw, default: bool) -> bool:
@@ -168,6 +183,31 @@ def build_payload(event: dict, preview_chars: int = 0, fn: str = "", actions: li
         payload["actions"] = names
     if preview_chars > 0:
         body = snippet(data.get("message") or "", preview_chars)
+        if body:
+            payload["body"] = body
+    return payload
+
+
+def build_channel_payload(event: dict, preview_chars: int = 0, fn: str = "", sender_name: str = "",
+                          actions: list | None = None, icon: str = "", badge: str = "") -> dict:
+    """What the device gets for a channel message: the channel's name (`#name`), or the sender's name
+    for a DM (a DM has no name), where to open it, and, only with `preview_chars`, the start of the text.
+    No `chat_id`: reply, read and mute act on a chat, so it carries no buttons (`actions` is accepted
+    only so the two builders take the same call)."""
+    data = event.get("data") or {}
+    channel_id = str(data.get("channel_id") or "")
+    name = str(data.get("title") or "")
+    title = (f"#{name}" if name else sender_name or CHANNEL_DEFAULT_TITLE)[:MAX_TITLE_CHARS]
+    payload = {"v": 2, "kind": event.get("event"), "source": event.get("source"), "channel_id": channel_id,
+               "message_id": data.get("message_id"), "title": title,
+               "url": "/channels/" + quote(channel_id, safe="")}
+    if fn:
+        payload["fn"] = fn
+    for key, value in (("icon", image_url(icon)), ("badge", image_url(badge))):
+        if value:
+            payload[key] = value
+    if preview_chars > 0:
+        body = snippet(mentions_as_text(data.get("content") or ""), preview_chars)
         if body:
             payload["body"] = body
     return payload
@@ -229,6 +269,11 @@ def topic_for(chat_id: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(chat_id.encode()).digest()[:24]).decode().rstrip("=")
 
 
+def channel_topic(channel_id: str) -> str:
+    """The Topic of a channel's push: its own space, so a chat that has the same id never replaces it."""
+    return topic_for(CHANNEL_ID_PREFIX + channel_id)
+
+
 def subject_problem(v: str) -> str:
     """Why `v` can't be the VAPID subject; "" when it can."""
     if not v.startswith(SUBJECT_SCHEMES):
@@ -266,12 +311,14 @@ def parse_subscriptions(raw) -> list:
     return [s for s in subs if isinstance(s, dict) and s.get("endpoint") and (s.get("keys") or {}).get("p256dh")]
 
 
-def should_send(event: dict, pipe_prefixes: list) -> bool:
-    """`chat.finished` only. For an OpenClaw model, only the Pipe's own: Open
-    WebUI's fires when the chat request ends, which for a reply the Pipe
-    handed over is before the reply does, and the Pipe publishes every reply
-    once it is saved (valve PUBLISH_CHAT_FINISHED)."""
-    if event.get("event") != "chat.finished":
+def should_send(event: dict, pipe_prefixes: list, channel_push: bool = True) -> bool:
+    """`chat.finished` and, while `channel_push` is on (valve CHANNEL_PUSH), `channel.message`. For an
+    OpenClaw model, only the Pipe's own `chat.finished`: Open WebUI's fires when the chat request
+    ends, which for a reply the Pipe handed over is before the reply does, and the Pipe publishes
+    every reply once it is saved (valve PUBLISH_CHAT_FINISHED)."""
+    if event.get("event") == CHANNEL_EVENT:
+        return channel_push
+    if event.get("event") != CHAT_EVENT:
         return False
     model_id = str((event.get("data") or {}).get("model_id") or "")
     if any(model_id.startswith(p) for p in pipe_prefixes):
@@ -320,6 +367,17 @@ class Event:
                         "in the notification. 0: off, the body says 'New reply'. The text shows on "
                         "the lock screen and in the notification shade of every subscribed device.")
 
+        CHANNEL_PUSH: bool = Field(
+            default=True,
+            description="Also notify for a channel message: a DM, an @mention, a message in a group "
+                        "channel you are in. Open WebUI's own per-channel mute applies (a mention still "
+                        "comes through). The kill switch: off sends none. Needs Open WebUI's admin "
+                        "setting ui.enable_user_webhooks on, which is what makes it publish channel events.")
+        CHANNEL_PREVIEW_CHARS: int = Field(
+            default=0, ge=0, le=2000,
+            description="Show the start of a channel message (plain text, at most this many characters) "
+                        "in the notification. 0: off, the body says 'New message'. The text shows on "
+                        "the lock screen of every subscribed device.")
         SWIPE_READ: bool = Field(
             default=True,
             description="A notification swiped away marks its chat read (Android Chrome; 'Clear all' marks "
@@ -341,11 +399,14 @@ class Event:
 
     async def event(self, event: dict, __id__: str = "", **kwargs):
         prefixes = [p.strip() for p in self.valves.PIPE_MODEL_PREFIXES.split(",") if p.strip()]
-        if not should_send(event, prefixes):
+        if not should_send(event, prefixes, self.valves.CHANNEL_PUSH):
             return
         data = event.get("data") or {}
         user_id = data.get("user_id") or (event.get("actor") or {}).get("id")
         if not user_id:
+            return
+        channel = event.get("event") == CHANNEL_EVENT
+        if channel and (not data.get("channel_id") or user_id == data.get("sender_id")):
             return
         from open_webui.models.functions import Functions
 
@@ -354,16 +415,18 @@ class Event:
         subs = parse_subscriptions(state.get("subscriptions"))
         if not subs:
             return
-        chat_id = str(data.get("chat_id") or "")
-        # Before anything is encrypted or sent: a muted chat sends nothing, to any device.
-        if is_muted(state.get("mutes"), chat_id):
-            log.info("web push: chat is muted, nothing sent chat_id=%s", chat_id)
-            return
-        chat = await self._chat(chat_id)
-        folder = await self._muted_folder(state.get("folder_mutes"), chat, user_id)
-        if folder:
-            log.info("web push: folder %s is muted, nothing sent chat_id=%s", folder[:8], chat_id)
-            return
+        chat_id = CHANNEL_ID_PREFIX + str(data.get("channel_id")) if channel else str(data.get("chat_id") or "")
+        chat = None
+        if not channel:   # a channel's mute is Open WebUI's: it does not publish for a muted member
+            # Before anything is encrypted or sent: a muted chat sends nothing, to any device.
+            if is_muted(state.get("mutes"), chat_id):
+                log.info("web push: chat is muted, nothing sent chat_id=%s", chat_id)
+                return
+            chat = await self._chat(chat_id)
+            folder = await self._muted_folder(state.get("folder_mutes"), chat, user_id)
+            if folder:
+                log.info("web push: folder %s is muted, nothing sent chat_id=%s", folder[:8], chat_id)
+                return
         key = self._private_key()
         if key is None:
             return
@@ -375,20 +438,36 @@ class Event:
         if not subject:
             log.info("web push: no VAPID subject, nothing sent chat_id=%s", chat_id)
             return
-        body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
-                                            parse_actions(self.valves.NOTIFICATION_ACTIONS),
-                                            swipe_read=self.valves.SWIPE_READ and is_on(state.get("swipe_read"), True),
-                                            icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE,
-                                            open_chat=await self._side_chat_parent(chat, user_id)))
+        if channel:
+            body = encode_payload(build_channel_payload(
+                event, self.valves.CHANNEL_PREVIEW_CHARS, fid, await self._dm_sender(data),
+                icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE))
+            topic = channel_topic(str(data["channel_id"]))
+        else:
+            body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid,
+                                                parse_actions(self.valves.NOTIFICATION_ACTIONS),
+                                                swipe_read=self.valves.SWIPE_READ and is_on(state.get("swipe_read"), True),
+                                                icon=self.valves.NOTIFICATION_ICON, badge=self.valves.NOTIFICATION_BADGE,
+                                                open_chat=await self._side_chat_parent(chat, user_id)))
+            topic = topic_for(chat_id)
         early = []
-        gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
-                                       key, subject, chat_id, early)
+        gone = await asyncio.to_thread(self.send_all, subs, body, topic, key, subject, chat_id, early)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
         if early:
-            task = asyncio.create_task(self._resend(early, body, topic_for(chat_id), key, subject, chat_id))
+            task = asyncio.create_task(self._resend(early, body, topic, key, subject, chat_id))
             self._pending.add(task)   # held until done: the loop keeps only weak references
             task.add_done_callback(self._pending.discard)
+
+    @staticmethod
+    async def _dm_sender(data: dict) -> str:
+        """The sender's name for a DM, which has no name of its own (`title` is empty); "" otherwise."""
+        if data.get("title"):
+            return ""
+        from open_webui.models.users import Users
+
+        sender = await Users.get_user_by_id(str(data.get("sender_id") or ""))
+        return str(getattr(sender, "name", "") or "")
 
     @staticmethod
     async def _state(Functions, fid: str, user_id: str) -> dict:

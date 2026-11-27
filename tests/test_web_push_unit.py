@@ -32,6 +32,16 @@ def finished(source="openclaw-pipe", model="openclaw_gateway.main", **data):
                      "title": "Trip plan", "url": "https://chat.example.com/c/c1", "message": REPLY, **data}}
 
 
+def channel_message(content="hello there", **data):
+    """What Open WebUI publishes per recipient (routers/channels.py send_notification): `user_id` is the
+    recipient, `sender_id` who wrote it; `title` is the channel's name, empty for a DM."""
+    return {"event": "channel.message", "source": "api", "actor": None,
+            "data": {"user_id": "u1", "channel_id": "ch1", "message_id": "m1", "sender_id": "u2",
+                     "content": content, "message": f"#Japan - https://chat.example.com/channels/ch1\n\n{content}",
+                     "content_preview": content[:300], "title": "Japan",
+                     "url": "https://chat.example.com/channels/ch1", **data}}
+
+
 class PayloadTests(unittest.TestCase):
     def test_the_payload_never_contains_the_reply(self):
         """chat.finished carries the whole reply; the device gets only title and link."""
@@ -77,6 +87,18 @@ class WhichEventsTests(unittest.TestCase):
     def test_other_events_are_not_sent(self):
         self.assertFalse(web_push.should_send({**finished(), "event": "chat.failed"}, PIPE))
 
+    def test_a_channel_message_is_sent_unless_the_kill_switch_is_off(self):
+        self.assertTrue(web_push.should_send(channel_message(), PIPE))
+        self.assertTrue(web_push.should_send(channel_message(), PIPE, channel_push=True))
+        self.assertFalse(web_push.should_send(channel_message(), PIPE, channel_push=False))
+
+    def test_the_kill_switch_leaves_chat_finished_alone(self):
+        self.assertTrue(web_push.should_send(finished(), PIPE, channel_push=False))
+
+    def test_a_channel_message_is_never_held_back_by_the_pipe_prefixes(self):
+        """A channel message has no model_id: the Pipe rule is for chat.finished."""
+        self.assertTrue(web_push.should_send(channel_message(model_id="openclaw_gateway.main"), PIPE))
+
     def test_no_prefixes_sends_every_chat_finished(self):
         self.assertTrue(web_push.should_send(finished(source="api"), []))
 
@@ -85,6 +107,54 @@ class WhichEventsTests(unittest.TestCase):
                           {"endpoint": "https://p/2"}, "junk", {"keys": {"p256dh": "k"}}])
         self.assertEqual([s["endpoint"] for s in web_push.parse_subscriptions(raw)], ["https://p/1"])
         self.assertEqual(web_push.parse_subscriptions("not json"), [])
+
+
+class ChannelPayloadTests(unittest.TestCase):
+    def payload(self, event=None, **kw):
+        return web_push.build_channel_payload(event or channel_message(), **kw)
+
+    def test_a_group_message_shows_the_channel_name_and_opens_the_channel(self):
+        p = self.payload()
+        self.assertEqual((p["kind"], p["channel_id"], p["title"], p["url"]),
+                         ("channel.message", "ch1", "#Japan", "/channels/ch1"))
+
+    def test_a_dm_shows_the_senders_name(self):
+        """A DM has no name of its own (`title` is empty): the sender's name is the title."""
+        self.assertEqual(self.payload(channel_message(title=""), sender_name="Ortal")["title"], "Ortal")
+
+    def test_a_dm_without_a_sender_name_still_has_a_title(self):
+        self.assertEqual(self.payload(channel_message(title=""))["title"], web_push.CHANNEL_DEFAULT_TITLE)
+
+    def test_it_carries_no_chat_id_and_no_buttons(self):
+        """Reply, read and mute act on a chat: a channel notification has none of them."""
+        p = self.payload(actions=["reply", "mute"], fn="web_push")
+        for key in ("chat_id", "actions", "swipe_read"):
+            self.assertNotIn(key, p)
+
+    def test_the_content_is_not_sent_by_default(self):
+        body = web_push.encode_payload(self.payload(channel_message("SECRET-CHANNEL-TEXT")))
+        self.assertNotIn("SECRET-CHANNEL-TEXT", body)
+        self.assertNotIn("body", json.loads(body))
+
+    def test_the_preview_valve_puts_the_start_of_the_message_in_the_body(self):
+        self.assertEqual(self.payload(channel_message("a long line of words"), preview_chars=10)["body"], "a long…")
+        self.assertNotIn("body", self.payload(preview_chars=0))
+
+    def test_a_mention_is_shown_as_its_label_in_the_preview(self):
+        p = self.payload(channel_message("hi <@U:u1|Eliav> and <@M:gpt|GPT-4>, ok?"), preview_chars=100)
+        self.assertEqual(p["body"], "hi @Eliav and @GPT-4, ok?")
+
+    def test_a_channel_id_is_safe_in_the_url(self):
+        self.assertEqual(self.payload(channel_message(channel_id="a/b c"))["url"], "/channels/a%2Fb%20c")
+
+    def test_the_payload_stays_under_the_push_limit(self):
+        long = "word " * 2000
+        body = web_push.encode_payload(self.payload(channel_message(long, title="x" * 500), preview_chars=2000))
+        self.assertLessEqual(len(body.encode()), web_push.MAX_PAYLOAD_BYTES)
+
+    def test_the_topic_of_a_channel_differs_from_a_chat_with_the_same_id(self):
+        self.assertNotEqual(web_push.channel_topic("ch1"), web_push.topic_for("ch1"))
+        self.assertLessEqual(len(web_push.channel_topic("ch1")), 32)
 
 
 class PreviewTests(unittest.TestCase):
@@ -200,7 +270,8 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         class Users:
             @staticmethod
             async def get_user_by_id(user_id):
-                return types.SimpleNamespace(settings=types.SimpleNamespace(model_dump=lambda: dict(settings)))
+                return types.SimpleNamespace(name=f"name-{user_id}",
+                                             settings=types.SimpleNamespace(model_dump=lambda: dict(settings)))
 
             @staticmethod
             async def update_user_settings_by_id(user_id, updated):
@@ -478,6 +549,81 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         await self.fn.event(finished(), __id__="web_push")
         (subs, body, key, subject), = self.sent
         self.assertEqual(json.loads(body)["body"], REPLY)
+
+    async def test_a_channel_message_is_sent_to_the_recipient(self):
+        await self.fn.event(channel_message(), __id__="web_push")
+        p = self.sent_payload()
+        self.assertEqual((p["kind"], p["channel_id"], p["title"], p["url"]),
+                         ("channel.message", "ch1", "#Japan", "/channels/ch1"))
+        self.assertNotIn("hello there", self.sent[0][1])
+        self.assertNotIn("chat_id", p)
+
+    async def test_the_sender_gets_no_push_for_their_own_message(self):
+        await self.fn.event(channel_message(user_id="u2", sender_id="u2"), __id__="web_push")
+        self.assertEqual(self.sent, [])
+
+    async def test_a_dm_is_titled_with_the_senders_name(self):
+        await self.fn.event(channel_message(title=""), __id__="web_push")
+        self.assertEqual(self.sent_payload()["title"], "name-u2")
+
+    async def test_a_group_message_does_not_look_up_the_sender(self):
+        """Only a DM needs the sender's name: a group has the channel's."""
+        users = sys.modules["open_webui.models.users"].Users
+        calls = []
+        real = users.get_user_by_id
+
+        async def spy(user_id):
+            calls.append(user_id)
+            return await real(user_id)
+        with mock.patch.object(users, "get_user_by_id", staticmethod(spy)):
+            await self.fn.event(channel_message(), __id__="web_push")
+        self.assertNotIn("u2", calls)
+
+    async def test_the_kill_switch_sends_nothing_and_chat_replies_still_go(self):
+        self.fn.valves.CHANNEL_PUSH = False
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_the_channel_preview_valve_is_its_own(self):
+        """PREVIEW_CHARS (a reply) does not turn on a channel message's preview; CHANNEL_PREVIEW_CHARS does."""
+        self.fn.valves.PREVIEW_CHARS = 600
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertNotIn("body", self.sent_payload())
+        self.sent.clear()
+        self.fn.valves.CHANNEL_PREVIEW_CHARS = 600
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(self.sent_payload()["body"], "hello there")
+
+    async def test_the_defaults_are_push_on_and_no_preview(self):
+        v = web_push.Event.Valves()
+        self.assertEqual((v.CHANNEL_PUSH, v.CHANNEL_PREVIEW_CHARS), (True, 0))
+
+    async def test_a_channel_message_needs_a_subscription(self):
+        self.store["subscriptions"] = "[]"
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+
+    async def test_a_chat_mute_does_not_hold_a_channel_and_nothing_reads_the_chat_tables(self):
+        """Per-channel mute is Open WebUI's (it does not publish for a muted member, a mention excepted);
+        a chat mute or a folder mute that happens to share the id changes nothing here."""
+        self.store["mutes"] = json.dumps({"ch1": 0})
+        self.store["folder_mutes"] = json.dumps({"qa": 0})
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.folder_reads, [])
+
+    async def test_the_send_is_logged_by_channel(self):
+        calls = []
+        self.fn.send_all = lambda subs, body, topic, key, subject, chat_id, early=None: calls.append((topic, chat_id)) or set()
+        await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(calls, [(web_push.channel_topic("ch1"), "channel:ch1")])
+
+    async def test_a_message_without_a_recipient_or_channel_sends_nothing(self):
+        await self.fn.event(channel_message(user_id=""), __id__="web_push")
+        await self.fn.event(channel_message(channel_id=""), __id__="web_push")
+        self.assertEqual(self.sent, [])
 
     async def test_the_middlewares_event_for_an_openclaw_model_sends_nothing(self):
         await self.fn.event(finished(source="api"), __id__="web_push")
