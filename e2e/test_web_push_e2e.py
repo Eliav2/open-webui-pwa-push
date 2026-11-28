@@ -3091,3 +3091,165 @@ def test_a_reconnecting_socket_with_http_up_sends_at_once(owui, pw):
         assert page.evaluate(OUTBOX_COUNT) in (0, -1)
     finally:
         ctx.close()
+
+
+# --- Channel messages (ELI-548): two users, each with a subscribed device (own Chrome profile) ---
+
+CHANNEL_TEXT = "SECRET-CHANNEL-TEXT"
+SENDER_NAME = "E2E"   # the admin of the stack, who sends
+
+
+def signed_up(name):
+    """A new plain user: (token, id)."""
+    r = api("/api/v1/auths/signup", {"name": name, "email": f"{name.lower()}-{uuid.uuid4().hex[:8]}@e2e.example.com",
+                                     "password": "e2e-pass-2"})
+    return r["token"], r["id"]
+
+
+def enabled_device(pw, token):
+    """A Chrome profile signed in as `token` with notifications allowed and this device subscribed."""
+    ctx, page = own_chrome(pw, token)
+    ctx.add_init_script(DECISIONS)
+    ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
+    page.goto(BASE + "/")
+    assert ready(page) == "no-permission"
+    ctx.grant_permissions(["notifications"], origin=BASE)
+    ctx.new_cdp_session(ctx.new_page()).send("Browser.setPermission", {
+        "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
+    page.bring_to_front()
+    page.get_by_role("button", name="Enable notifications for replies").click()
+    page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
+    assert page.evaluate("() => window.ocPushState") == "saved"
+    push_connection_live(ctx, BASE)
+    return ctx, page
+
+
+def post(token, channel, content):
+    return api(f"/api/v1/channels/{channel}/messages/post", {"content": content}, token)
+
+
+# Open WebUI publishes `channel.message` only for a member with no live socket session: a page connects
+# its socket to every one of its user's channels (socket/main.py `connect`), open or not, in front or not.
+# So a device is "away" here by parking its page on a file of the site: the service worker still runs, no
+# Open WebUI socket is open, and the shown notifications are read from the registration.
+PARKED = "/manifest.json"
+ALL_DEVICES = []   # the pages of `pair`, for a failure's report
+
+
+def park(ctx, page):
+    """The page away from Open WebUI and off the screen (another tab in front: the worker shows a
+    notification only when no Open WebUI window is in front)."""
+    page.goto(BASE + PARKED)
+    return behind(ctx, page)
+
+
+def shown(page):
+    return page.evaluate(NOTES)
+
+
+def wait_shown(page, tag):
+    """Waits until a notification with this tag is showing; returns it."""
+    end = time.time() + PUSH_WAIT_MS / 1000
+    while time.time() < end:
+        found = [n for n in shown(page) if n["tag"] == tag]
+        if found:
+            return found[0]
+        time.sleep(STATE_POLL_S)
+    print(push_diagnostics(page))
+    print("shown now:", json.dumps(shown(page)))
+    for other in ALL_DEVICES:
+        if other is not page:
+            print("another device shows:", json.dumps(shown(other)), "| its subscription:", fingerprint(other.evaluate(ENDPOINT)))
+    raise AssertionError("no notification tagged " + tag)
+
+
+def channel_notes(page):
+    return [n for n in shown(page) if n["tag"].startswith("channel-")]
+
+
+def channel_decisions(page):
+    return page.evaluate("() => window.ocPushSeen.filter(d => d.payload.channel_id).map(d => d.payload.message_id)")
+
+
+@pytest.fixture(scope="module")
+def pair(owui, pw):
+    """Two users (the stack's admin `E2E` and `Bea`), each with a subscribed device; Open WebUI told to
+    publish channel events (ui.enable_user_webhooks) and to have channels on."""
+    cfg = api("/api/v1/auths/admin/config", token=owui)
+    api("/api/v1/auths/admin/config", {**cfg, "ENABLE_CHANNELS": True, "ENABLE_USER_WEBHOOKS": True}, owui)
+    bea, bea_id = signed_up("Bea")
+    # A plain user may use the stub model (the chat replies that serve as barriers for Bea).
+    try:
+        api("/api/v1/models/create", {"id": "stub", "name": "Stub", "meta": {}, "params": {}, "is_active": True,
+                                      "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}, owui)
+    except urllib.error.HTTPError:
+        pass   # made by an earlier run of this stack
+    a = enabled_device(pw, owui)
+    b = enabled_device(pw, bea)
+    ALL_DEVICES[:] = [a[1], b[1]]
+    yield a, b, bea, bea_id
+    a[0].close()
+    b[0].close()
+
+
+def test_channel_messages_push_the_other_members_with_no_text_and_open_the_channel(owui, pair):
+    (a_ctx, a_page), (b_ctx, b_page), bea, bea_id = pair
+    name = api("/api/v1/auths/", token=owui)["name"]
+    park(a_ctx, a_page)   # both away, as two phones with Open WebUI closed
+    park(b_ctx, b_page)
+    # A group channel: Bea gets one, titled by the channel, no text, opening the channel; the sender gets none.
+    made = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)
+    group, title = made["id"], "#" + made["name"]   # Open WebUI keeps a group channel's name lower case
+    post(owui, group, f"{CHANNEL_TEXT} first")
+    n = wait_shown(b_page, f"channel-{group}")
+    assert (n["title"], n["body"], n["url"]) == (title, "New message", f"/channels/{group}"), n
+    assert CHANNEL_TEXT not in json.dumps(shown(b_page))
+    # The sender's device: a chat reply that follows is the barrier; no channel notification came before it.
+    chat, msg = new_chat(owui, "stub", "Barrier A")
+    reply(owui, "stub", chat, msg)
+    wait_shown(a_page, f"chat-{chat}")
+    assert channel_notes(a_page) == []
+
+    # A DM has no name: the sender's name is the title.
+    dm = api("/api/v1/channels/create", {"type": "dm", "user_ids": [bea_id]}, owui)["id"]
+    post(owui, dm, "psst")
+    n = wait_shown(b_page, f"channel-{dm}")
+    assert (n["title"], n["url"]) == (name, f"/channels/{dm}"), n
+
+    # Muted in Open WebUI: a plain message sends nothing; the @mention of Bea does, once (a second
+    # push in the channel would stack: its title would count "2 new messages").
+    b_page.evaluate(CLEAR)
+    api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": True}, bea)
+    post(owui, group, "plain, while muted")
+    post(owui, group, f"hey <@U:{bea_id}|Bea> a mention")
+    n = wait_shown(b_page, f"channel-{group}")
+    assert n["title"] == title, n
+    api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": False}, bea)
+
+    # With Open WebUI open and connected on the device, Open WebUI publishes nothing; opening the
+    # channel closes its notification.
+    b_page.goto(f"{BASE}/channels/{group}")
+    b_page.bring_to_front()
+    b_page.wait_for_function("async () => !(await (await navigator.serviceWorker.ready).getNotifications({tag: 'channel-%s'})).length" % group,
+                             timeout=WAIT_MS)
+    post(owui, group, "while it is open")
+    b_chat, b_msg = new_chat(bea, "stub", "Barrier open")
+    reply(bea, "stub", b_chat, b_msg)
+    seen_for(b_page, b_chat)
+    assert channel_decisions(b_page) == []
+    assert channel_notes(b_page) == []
+
+    # The kill switch (valve CHANNEL_PUSH): nothing for a channel; a reply to a chat still notifies.
+    park(b_ctx, b_page)
+    b_page.evaluate(CLEAR)
+    api("/api/v1/functions/id/web_push/valves/update",
+        {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com", "CHANNEL_PUSH": False}, owui)
+    try:
+        post(owui, dm, "while the switch is off")
+        b_chat, b_msg = new_chat(bea, "stub", "Barrier switch")
+        reply(bea, "stub", b_chat, b_msg)
+        wait_shown(b_page, f"chat-{b_chat}")
+        assert channel_notes(b_page) == []
+    finally:
+        api("/api/v1/functions/id/web_push/valves/update",
+            {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com"}, owui)

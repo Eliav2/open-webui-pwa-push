@@ -44,6 +44,7 @@ function worker({ site = {} } = {}) {
   }
   // The server: `site` answers its paths (a function per path), anything else gets a token.
   const fetched = [];
+  const opened = [];   // windows the worker opened (no page was open), by url
   // Open WebUI's state API: every call recorded; the user's settings and the function's 0.6.0 user valves
   // answer from `server` (a test sets them). Open WebUI 0.13's settings update replaces only the keys it is sent.
   const calls = [];
@@ -74,7 +75,7 @@ function worker({ site = {} } = {}) {
     navigator: { userAgent: "Mozilla/5.0 (Linux; Android 14) Chrome/140", maxTouchPoints: 0 },
     location: { origin: "https://chat.example" },
     registration,
-    clients: { matchAll: async () => [], claim: async () => {} },
+    clients: { matchAll: async () => [], claim: async () => {}, openWindow: async (url) => { opened.push(url); } },
     addEventListener: (type, fn) => { listeners[type] = fn; },
   };
   vm.runInNewContext(fs.readFileSync(SW, "utf8"), { self, URL, console, setTimeout, clearTimeout, caches, WebSocket, fetch,
@@ -92,7 +93,7 @@ function worker({ site = {} } = {}) {
   }
   // A swipe: Android removes the notification, then Chrome fires notificationclose.
   const swipe = (n) => { n.close(); return fire("notificationclose", n); };
-  return { push, shown, tag: (id) => shown.get("chat-" + id), fire, swipe, reads, caches, fetched, calls, server };
+  return { push, shown, tag: (id) => shown.get("chat-" + id), channel: (id) => shown.get("channel-" + id), fire, swipe, reads, caches, fetched, calls, server, opened };
 }
 
 const reply = (chat, body, title = "Trip plan") => ({ chat_id: chat, title, body, url: "/c/" + chat });
@@ -291,4 +292,62 @@ test("Mute writes nothing when the old user valves cannot be read (they may hold
   await w.fire("notificationclick", w.tag("a"), { action: "mute" });
   assert.ok(!w.calls.some((c) => c.method === "POST" && /settings\/update/.test(c.path)),
     "a write with the devices missing would wipe them");
+});
+
+// A channel message (ELI-548): no chat_id, so no buttons and no read; its own tag per channel.
+const message = (channel, body, title = "#Japan") => ({ kind: "channel.message", channel_id: channel, title, body, url: "/channels/" + channel });
+
+test("a channel message shows its title, 'New message' without a preview, and no buttons", async () => {
+  const w = worker();
+  await w.push({ ...message("ch1"), fn: "fn1", actions: ["reply", "mute"] });
+  const n = w.channel("ch1");
+  assert.equal(n.title, "#Japan");
+  assert.equal(n.body, "New message");
+  assert.deepEqual(n.actions, []);
+  assert.equal(n.tag, "channel-ch1");
+  assert.equal(n.data.chat_id, "");
+});
+
+test("messages in one channel stack in one notification; another channel and a chat with the same id have their own", async () => {
+  const w = worker();
+  await w.push(message("a", "one"));
+  await w.push(message("a", "two"));
+  await w.push(message("b", "other", "#Food"));
+  await w.push(reply("a", "a chat reply"));
+  assert.equal(w.channel("a").title, "#Japan · 2 new messages");
+  assert.equal(w.channel("a").body, "one\ntwo");
+  assert.equal(w.channel("b").title, "#Food");
+  assert.equal(w.tag("a").title, "Trip plan");
+  assert.equal(w.shown.size, 3);
+});
+
+test("a tap on a channel notification opens /channels/<id>", async () => {
+  const w = worker();
+  await w.push(message("ch1", "hi"));
+  await w.fire("notificationclick", w.channel("ch1"));
+  assert.deepEqual(w.opened, ["https://chat.example/channels/ch1"]);
+});
+
+test("swiping a channel notification marks nothing read (a channel is not a chat)", async () => {
+  const w = worker();
+  await w.push(message("ch1", "hi"));
+  await w.swipe(w.channel("ch1"));
+  assert.deepEqual(w.reads, []);
+  assert.equal(w.calls.filter((c) => c.method === "POST").length, 0);
+});
+
+test("a closed channel notification starts its stack again", async () => {
+  const w = worker();
+  await w.push(message("ch1", "one"));
+  await w.push(message("ch1", "two"));
+  w.channel("ch1").close();
+  await w.push(message("ch1", "three"));
+  assert.equal(w.channel("ch1").title, "#Japan");
+  assert.equal(w.channel("ch1").body, "three");
+});
+
+test("a push with neither chat_id nor channel_id still shows, under one shared tag, as before", async () => {
+  const w = worker();
+  await w.push({ title: "x", url: "/" });
+  assert.equal([...w.shown.keys()].join(), "chat-none");
 });

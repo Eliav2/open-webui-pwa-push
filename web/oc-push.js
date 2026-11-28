@@ -175,6 +175,8 @@
   }
 
   const chatIdNow = () => (location.pathname.match(/^\/c\/([^/]+)/) || [])[1] || "";
+  // Open WebUI's channels (/channels/<id>): messages there push as `channel.message` (ELI-548).
+  const channelIdNow = () => (location.pathname.match(/^\/channels\/([^/]+)/) || [])[1] || "";
 
   // With no network, while the service worker opens the app from what it kept
   // (offline open on: its app cache is there), a pill says so. The message box
@@ -706,14 +708,16 @@
 
   // A chat on screen, however it was opened: its notifications on this device
   // are read, close them (the tag is oc-sw.js's, one per chat).
-  const TAG_PREFIX = "chat-";
-  async function seen(id) {
+  const TAG_PREFIX = "chat-", CHANNEL_TAG_PREFIX = "channel-";
+  // Whatever is on screen: the chat's and the channel's notifications are read.
+  const seenHere = () => Promise.all([seen(chatIdNow()), seen(channelIdNow(), CHANNEL_TAG_PREFIX)]);
+  async function seen(id, prefix = TAG_PREFIX) {
     if (!id || document.visibilityState !== VISIBLE) return;
     const reg = await navigator.serviceWorker.getRegistration("/");
     // Marked as this code's own close first (oc-sw.js OWN_CLOSES): not a swipe. Without
     // Cache Storage the mark is skipped, never the close.
     const own = await caches.open("oc-push-own-closes").catch(() => null);
-    for (const n of (await reg?.getNotifications({ tag: TAG_PREFIX + id })) || []) {
+    for (const n of (await reg?.getNotifications({ tag: prefix + id })) || []) {
       await own?.put("/oc-push/closed/" + n.tag + "/" + n.timestamp, new Response("")).catch(() => {});
       n.close();
     }
@@ -721,7 +725,7 @@
   }
 
   async function chatPage() {
-    seen(chatIdNow()).catch(() => {});
+    seenHere().catch(() => {});
     if (!store.get("token") || !PUSH) return;
     if (mutes === null) await loadMutes().catch(() => {});
     placeBell();
@@ -783,7 +787,7 @@
     if (document.visibilityState !== VISIBLE) return;
     navigator.serviceWorker.getRegistration("/").then((r) => r && r.update()).catch(() => {});
     const id = chatIdNow();
-    seen(id).catch(() => {});
+    seenHere().catch(() => {});
     // Mutes may have changed on another device.
     if (PUSH && store.get("token") && id) Promise.all([loadMutes(), loadFolder(id)]).then(drawBell).catch(() => {});
   });
@@ -803,7 +807,7 @@
     if (to.origin !== location.origin) return;
     if (to.pathname === location.pathname && !to.search) {
       window.ocPushOpenedSame = true;
-      seen(chatIdNow()).catch(() => {});
+      seenHere().catch(() => {});
       return;
     }
     const a = document.createElement("a");
@@ -812,7 +816,7 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
-    window.ocPushOpened = to.pathname.slice("/c/".length);
+    window.ocPushOpened = to.pathname.split("/")[2] || "";   // /c/<id> or /channels/<id>
   });
   navigator.serviceWorker.startMessages?.();
 

@@ -32,7 +32,7 @@ It works with **any Open WebUI**, whatever models you use. Nothing in Open WebUI
 |---|---|---|---|---|
 | Service worker | [`web/oc-sw.js`](./web/oc-sw.js) | `/oc-sw.js` | Shows the notifications and runs their buttons; keeps the app and the chats read last on the device | everything |
 | Page script | [`web/oc-push.js`](./web/oc-push.js) | `/static/loader.js` | Registers the service worker; offers "Enable notifications" and saves each device's subscription; adds the bell and the menu items; the offline and "Updating…" pills | everything |
-| Event function | [`openclaw_web_push.py`](./openclaw_web_push.py) | an Open WebUI function | On each `chat.finished`, sends a push to each of the user's devices | push only |
+| Event function | [`openclaw_web_push.py`](./openclaw_web_push.py) | an Open WebUI function | On each `chat.finished` and each `channel.message`, sends a push to each of the user's devices | push only |
 
 Open WebUI loads `/static/loader.js` on every page (the file is empty in a stock install), but it rebuilds `/static` on every start, so both scripts come from the proxy, not from Open WebUI's files. The [Cloudflare Worker](#serve-the-scripts-with-a-cloudflare-worker) and [nginx](#serve-the-scripts-with-nginx) examples answer exactly those two paths and pass everything else through.
 
@@ -186,6 +186,17 @@ A notification when a reply finishes, on each of your devices, with the chat's t
 <p align="center"><img src="./docs/img/android-notification.png" alt="An Android notification: Trip ideas, a preview of the reply, Reply and Mark as read" width="420"></p>
 <p align="center"><sub>With <code>PREVIEW_CHARS</code> on and <code>NOTIFICATION_ACTIONS=reply,read</code>. With the defaults the body says "New reply" and the buttons are Reply and Mute 8 h (Chrome adds its own Unsubscribe).</sub></p>
 
+### Channel messages
+
+A message in an Open WebUI channel (a DM, an @mention, or a message in a group channel you are in) notifies the same devices, from `channel.message`, the event Open WebUI 0.13 publishes for each channel member who is not looking at that channel.
+
+- **Open WebUI must publish it.** It does so only while the admin setting `ui.enable_user_webhooks` is on (the "User Webhooks" toggle in the admin settings, or the `ENABLE_USER_WEBHOOKS` environment variable on a first start; `routers/channels.py` `send_notification` skips the event otherwise, and for a user who has no saved settings, which a user with a saved device has). That setting only shows the webhook field to admins in their own settings: it is the switch for the event. Turn the valve [`CHANNEL_PUSH`](#settings) off and the function sends none, whatever the setting.
+- **Who gets one.** Every member except the sender, and only while that user has no Open WebUI page connected: a page joins the socket room of every channel its user is in as soon as it connects (`socket/main.py`), open or not, in front or not, and Open WebUI publishes only for members it finds in no room. A phone with Open WebUI closed, or whose background page lost its connection, is notified; a desktop tab left open is not. A channel you muted in Open WebUI sends nothing, except for a message that @mentions you: both rules are Open WebUI's, applied before it publishes. The function's own chat and folder mutes are for chats and do not apply.
+- **Title and tap.** `#channel name` for a group channel, the sender's name for a DM. A tap opens `/channels/<id>`. Messages in one channel stack in one notification, as chat replies do; a channel on screen closes its notification.
+- **No buttons.** Reply, Mark as read and Mute 8 h act on a chat, so a channel notification has none, and a swipe marks nothing read.
+- **No preview by default.** The push carries the channel's name, its id and its link; [`CHANNEL_PREVIEW_CHARS`](#settings) above 0 adds the start of the message as plain text (a mention shown as `@name`). It is its own valve: `PREVIEW_CHARS` is for replies.
+- **Not covered:** a reply an OpenClaw model writes in a channel thread (Open WebUI posts it itself and publishes no event), and a message posted through a channel's incoming webhook (`POST /api/v1/channels/webhooks/<id>/<token>`, no event either).
+
 ### Reply from the notification
 
 **Reply** opens a text field in the notification (Android Chrome). What you type is sent to the chat as your message, the way Open WebUI 0.13.0's chat page sends one, and the model answers as if you had typed it in the app. While the chat's reply is still running, the message reaches it like one sent from another tab.
@@ -275,6 +286,8 @@ The function's valves, in **Admin Panel > Functions > Web Push > Valves** (the g
 | `PIPE_MODEL_PREFIXES` | `openclaw_gateway.` | Models served by the OpenClaw Pipe. For these only the Pipe's own `chat.finished` is sent ([OpenClaw models](#openclaw-models)). |
 | `NOTIFICATION_ACTIONS` | `reply,mute` | The notification's buttons, in order, from `reply`, `read`, `mute`. Android Chrome shows two. |
 | `PREVIEW_CHARS` | `0` (off) | Up to this many characters of the reply in the notification ([privacy](#notifications)). |
+| `CHANNEL_PUSH` | on | Also notify for channel messages ([Channel messages](#channel-messages)). The kill switch: off sends none. Needs Open WebUI's `ui.enable_user_webhooks` on. |
+| `CHANNEL_PREVIEW_CHARS` | `0` (off) | Up to this many characters of a channel message in the notification. |
 | `NOTIFICATION_ICON` | empty | The picture beside the text: a path on the site (`/static/...`) or an `https:` URL. Empty: Open WebUI's own app icon. |
 | `NOTIFICATION_BADGE` | empty | Android's small status-bar icon, drawn from its transparency only (a white shape on a transparent background). A path on the site or an `https:` URL. Empty: the browser's own. |
 
@@ -296,7 +309,7 @@ The function has no user valves. Each user's devices, mutes and the like (`subsc
 - **Gone subscriptions:** a device whose push service answers 404 or 410 is removed from the user's list, and its next page load makes a new subscription in place of the dead one the browser may still hold. A subscription less than 10 minutes old is kept instead: Chrome's push service (FCM) refuses a brand-new one for a few seconds.
 - **A brand-new device may get its first notification about 30 s late:** that's FCM taking the new subscription; the function sends a notification it refused once more when the subscription is 30 s old.
 - **Tap to open:** a tap focuses an open Open WebUI window and opens the chat inside it, as a click in the sidebar does (no reload), or opens a new window when none is open.
-- **The log:** what the function did is in Open WebUI's log, each line ending with the chat's id (`web push: sent to fcm.googleapis.com chat_id=…`, `web push: chat is muted, nothing sent chat_id=…`).
+- **The log:** what the function did is in Open WebUI's log, each line ending with the chat's id (`web push: sent to fcm.googleapis.com chat_id=…`, `web push: chat is muted, nothing sent chat_id=…`); for a channel the id reads `channel:<id>`.
 
 ### Offline open, request by request
 
@@ -319,6 +332,7 @@ Only `GET` requests to your own Open WebUI; everything else goes straight to the
 
 - **Two mute changes at the same time can lose one.** The bell, the menus and the notification's Mute button each read your state and write it all back as one key. Two writers at once (two devices, two tabs) can put back the other's old value. If a mute did not stick, change it again.
 - **Open WebUI 0.13.0's pages.** The menu items are found by the structure and icons of Open WebUI 0.13.0's menus, not by their text (they are translated). A later version that draws them differently gets no items, and the console says once which menu it did not recognise. `e2e/` checks this contract against the pinned version. The same holds for the side chat's panel: the navbar's Tabs button (its one button with `aria-expanded` and no menu) and a tab's `chat-panel-<id>` element. A version that draws them differently still opens the parent chat, but not its sheet.
+- **Channel pushes wait for the socket to drop.** While any Open WebUI page of yours is connected (a tab left open, a phone's background page until the system cuts its connection), Open WebUI publishes no channel event for you, so there is no push for it. It is Open WebUI's rule, not this function's; `e2e/` checks it.
 - **Safari tabs** get nothing ([iPhone and iPad](#iphone-and-ipad)).
 - **A push the push service accepted is its to deliver.** If the device's own connection to it is not up yet (seen once on a freshly reset Android Chrome), the notification comes late or not at all; the function is not told and sends nothing again.
 
@@ -333,7 +347,7 @@ Each part is separate:
 
 ## Development
 
-- `tests/` (pytest): the function's payload (never the reply), which events are sent, and a real encrypted send to a local push service. `uv run --with-requirements requirements-dev.txt pytest -q tests`
+- `tests/` (pytest): the function's payload (never the reply or the message text), which events are sent (chat replies, channel messages), and a real encrypted send to a local push service. `uv run --with-requirements requirements-dev.txt pytest -q tests`
 - `web/*.test.js`, `examples/cloudflare-worker/*.test.js` (`node --test`): the service worker, the page script and the Worker, in sandboxes.
 - `e2e/`: Google Chrome against the real push service (FCM), the Worker example under `wrangler dev` and a throwaway Open WebUI 0.13.0. It needs Google Chrome (Chromium has no push service), Docker, `bunx` and outbound internet, and an `openclaw_pipe.py` build for the OpenClaw case ([the Pipe repo](https://github.com/Eliav2/openclaw-openwebui-integration)):
 

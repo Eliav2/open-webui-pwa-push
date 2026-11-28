@@ -22,6 +22,7 @@ const VISIBLE = "visible";
 const ACTION = Object.freeze({ REPLY: "reply", READ: "read", MUTE: "mute" });
 // The notification tag is per chat (oc-push.js uses the same).
 const TAG_PREFIX = "chat-";
+const CHANNEL_TAG_PREFIX = "channel-";   // a channel message (Open WebUI channels), one notification per channel
 // The buttons a push may ask for. "text" gives Reply a text field in the shade.
 // The notification's picture: Open WebUI's own app icon (the first picture of its
 // web app manifest, the one an installed app has), unless the function's
@@ -54,7 +55,7 @@ async function closeOwn(n) {
   await (await caches.open(OWN_CLOSES)).put(ownCloseKey(n), new Response(""));
   n.close();
 }
-const DEFAULT_TITLE = "Open WebUI", DEFAULT_BODY = "New reply";
+const DEFAULT_TITLE = "Open WebUI", DEFAULT_BODY = "New reply", CHANNEL_BODY = "New message";
 
 // Several replies in one chat stack in its one notification, as in a messaging
 // app: the title counts them, the body keeps the latest previews, newest last.
@@ -71,14 +72,14 @@ function stackLine(text) {
 }
 
 // `prev`: the chat's notification still shown (its data), or none. Returns what to show now.
-function stacked(prev, p) {
+function stacked(prev, p, emptyBody = DEFAULT_BODY) {
   const name = p.title || DEFAULT_TITLE;
   const line = stackLine(p.body);
   const count = (prev?.count || 0) + 1;
   const lines = [...(prev?.lines || []), ...(line ? [line] : [])].slice(-STACK_MAX_LINES);
   return {
     title: count > SINGLE ? `${name} · ${count} new messages` : name,
-    body: lines.length ? lines.join("\n") : DEFAULT_BODY,
+    body: lines.length ? lines.join("\n") : emptyBody,
     count, lines,
   };
 }
@@ -123,17 +124,17 @@ self.addEventListener("push", (e) => {
     const inFront = wins.some((c) => c.focused && c.visibilityState === VISIBLE);
     const shown = MUST_SHOW || !inFront;
     if (shown) {
-      const tag = TAG_PREFIX + (p.chat_id || "none");
-      const [prev] = p.chat_id ? await self.registration.getNotifications({ tag }) : [];
+      const tag = p.channel_id ? CHANNEL_TAG_PREFIX + p.channel_id : TAG_PREFIX + (p.chat_id || "none");
+      const [prev] = p.chat_id || p.channel_id ? await self.registration.getNotifications({ tag }) : [];
       // The marks of this tag's earlier notifications: no close of theirs is coming any more.
       const own = await caches.open(OWN_CLOSES);
       for (const k of await own.keys()) if (new URL(k.url).pathname.startsWith("/oc-push/closed/" + tag + "/")) await own.delete(k);
       // The one showing is replaced by this one: this code's close, not a swipe.
       if (prev) await own.put(ownCloseKey(prev), new Response(""));
-      const s = stacked(prev?.data?.stack, p);
+      const s = stacked(prev?.data?.stack, p, p.channel_id ? CHANNEL_BODY : DEFAULT_BODY);
       await self.registration.showNotification(s.title, {
         body: s.body,
-        tag,   // one per chat: a newer one replaces it (oc-push.js closes it when the chat is opened)
+        tag,   // one per chat or channel: a newer one replaces it (oc-push.js closes it when it is opened)
         renotify: true,   // each new reply sounds once
         icon: p.icon || await ownIcon(),
         badge: p.badge || undefined,   // Android's small icon: only its alpha is drawn
