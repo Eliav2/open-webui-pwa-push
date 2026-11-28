@@ -3178,6 +3178,12 @@ def pair(owui, pw):
     cfg = api("/api/v1/auths/admin/config", token=owui)
     api("/api/v1/auths/admin/config", {**cfg, "ENABLE_CHANNELS": True, "ENABLE_USER_WEBHOOKS": True}, owui)
     bea, bea_id = signed_up("Bea")
+    # A plain user may use the stub model (the chat replies that serve as barriers for Bea).
+    try:
+        api("/api/v1/models/create", {"id": "stub", "name": "Stub", "meta": {}, "params": {}, "is_active": True,
+                                      "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}, owui)
+    except urllib.error.HTTPError:
+        pass   # made by an earlier run of this stack
     a = enabled_device(pw, owui)
     b = enabled_device(pw, bea)
     ALL_DEVICES[:] = [a[1], b[1]]
