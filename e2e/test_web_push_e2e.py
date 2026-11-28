@@ -3136,8 +3136,11 @@ PARKED = "/manifest.json"
 ALL_DEVICES = []   # the pages of `pair`, for a failure's report
 
 
-def park(page):
+def park(ctx, page):
+    """The page away from Open WebUI and off the screen (another tab in front: the worker shows a
+    notification only when no Open WebUI window is in front)."""
     page.goto(BASE + PARKED)
+    return behind(ctx, page)
 
 
 def shown(page):
@@ -3186,8 +3189,8 @@ def pair(owui, pw):
 def test_channel_messages_push_the_other_members_with_no_text_and_open_the_channel(owui, pair):
     (a_ctx, a_page), (b_ctx, b_page), bea, bea_id = pair
     name = api("/api/v1/auths/", token=owui)["name"]
-    park(a_page)   # both away, as two phones with Open WebUI closed
-    park(b_page)
+    park(a_ctx, a_page)   # both away, as two phones with Open WebUI closed
+    park(b_ctx, b_page)
     # A group channel: Bea gets one, titled by the channel, no text, opening the channel; the sender gets none.
     group = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)["id"]
     post(owui, group, f"{CHANNEL_TEXT} first")
@@ -3230,7 +3233,7 @@ def test_channel_messages_push_the_other_members_with_no_text_and_open_the_chann
     assert channel_notes(b_page) == []
 
     # The kill switch (valve CHANNEL_PUSH): nothing for a channel; a reply to a chat still notifies.
-    park(b_page)
+    park(b_ctx, b_page)
     b_page.evaluate(CLEAR)
     api("/api/v1/functions/id/web_push/valves/update",
         {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com", "CHANNEL_PUSH": False}, owui)
