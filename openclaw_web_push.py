@@ -2,7 +2,7 @@
 title: Web Push notifications
 author: Eliav2
 author_url: https://github.com/Eliav2/open-webui-pwa-push
-version: 0.8.0
+version: 0.8.1
 requirements: pywebpush==2.0.3
 description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes (the chat's title and link) and when a channel message arrives (the channel's name or the sender, and its link); the start of the text only when PREVIEW_CHARS / CHANNEL_PREVIEW_CHARS is on. Muted chats and chats in muted folders send nothing; Open WebUI's own channel mute holds channel messages.
 """
@@ -408,6 +408,8 @@ class Event:
         channel = event.get("event") == CHANNEL_EVENT
         if channel and (not data.get("channel_id") or user_id == data.get("sender_id")):
             return
+        if channel and not await self._is_member(str(data["channel_id"]), user_id):
+            return
         from open_webui.models.functions import Functions
 
         fid = __id__ or "openclaw_web_push"
@@ -458,6 +460,23 @@ class Event:
             task = asyncio.create_task(self._resend(early, body, topic, key, subject, chat_id))
             self._pending.add(task)   # held until done: the loop keeps only weak references
             task.add_done_callback(self._pending.discard)
+
+    @staticmethod
+    async def _is_member(channel_id: str, user_id: str) -> bool:
+        """Defence in depth: Open WebUI publishes a channel message per member, and a push names the channel
+        (or the sender) on a lock screen, so the function checks once more. A check that cannot be made
+        sends nothing."""
+        from open_webui.models.channels import Channels
+
+        try:
+            member = await Channels.get_member_by_channel_and_user_id(channel_id, user_id)
+        except Exception as ex:
+            log.warning("web push: cannot read the channel membership, nothing sent chat_id=%s%s: %r",
+                        CHANNEL_ID_PREFIX, channel_id, ex)
+            return False
+        if member is None:
+            log.info("web push: recipient is not a member, nothing sent chat_id=%s%s", CHANNEL_ID_PREFIX, channel_id)
+        return member is not None
 
     @staticmethod
     async def _dm_sender(data: dict) -> str:
