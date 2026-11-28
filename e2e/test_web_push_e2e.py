@@ -3145,8 +3145,14 @@ def shown(page):
 
 def wait_shown(page, tag):
     """Waits until a notification with this tag is showing; returns it."""
-    settled(page, f"async () => (await (await navigator.serviceWorker.ready).getNotifications({{tag: {json.dumps(tag)}}})).length > 0")
-    return next(n for n in shown(page) if n["tag"] == tag)
+    end = time.time() + PUSH_WAIT_MS / 1000
+    while time.time() < end:
+        found = [n for n in shown(page) if n["tag"] == tag]
+        if found:
+            return found[0]
+        time.sleep(STATE_POLL_S)
+    print(push_diagnostics(page))
+    raise AssertionError("no notification tagged " + tag)
 
 
 def channel_notes(page):
