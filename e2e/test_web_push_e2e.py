@@ -3192,10 +3192,11 @@ def test_channel_messages_push_the_other_members_with_no_text_and_open_the_chann
     park(a_ctx, a_page)   # both away, as two phones with Open WebUI closed
     park(b_ctx, b_page)
     # A group channel: Bea gets one, titled by the channel, no text, opening the channel; the sender gets none.
-    group = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)["id"]
+    made = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)
+    group, title = made["id"], "#" + made["name"]   # Open WebUI keeps a group channel's name lower case
     post(owui, group, f"{CHANNEL_TEXT} first")
     n = wait_shown(b_page, f"channel-{group}")
-    assert (n["title"], n["body"], n["url"]) == ("#Japan", "New message", f"/channels/{group}"), n
+    assert (n["title"], n["body"], n["url"]) == (title, "New message", f"/channels/{group}"), n
     assert CHANNEL_TEXT not in json.dumps(shown(b_page))
     # The sender's device: a chat reply that follows is the barrier; no channel notification came before it.
     chat, msg = new_chat(owui, "stub", "Barrier A")
@@ -3216,7 +3217,7 @@ def test_channel_messages_push_the_other_members_with_no_text_and_open_the_chann
     post(owui, group, "plain, while muted")
     post(owui, group, f"hey <@U:{bea_id}|Bea> a mention")
     n = wait_shown(b_page, f"channel-{group}")
-    assert n["title"] == "#Japan", n
+    assert n["title"] == title, n
     api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": False}, bea)
 
     # With Open WebUI open and connected on the device, Open WebUI publishes nothing; opening the
