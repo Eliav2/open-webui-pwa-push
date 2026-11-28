@@ -3133,6 +3133,7 @@ def post(token, channel, content):
 # So a device is "away" here by parking its page on a file of the site: the service worker still runs, no
 # Open WebUI socket is open, and the shown notifications are read from the registration.
 PARKED = "/manifest.json"
+ALL_DEVICES = []   # the pages of `pair`, for a failure's report
 
 
 def park(page):
@@ -3152,6 +3153,10 @@ def wait_shown(page, tag):
             return found[0]
         time.sleep(STATE_POLL_S)
     print(push_diagnostics(page))
+    print("shown now:", json.dumps(shown(page)))
+    for other in ALL_DEVICES:
+        if other is not page:
+            print("another device shows:", json.dumps(shown(other)), "| its subscription:", fingerprint(other.evaluate(ENDPOINT)))
     raise AssertionError("no notification tagged " + tag)
 
 
@@ -3172,6 +3177,7 @@ def pair(owui, pw):
     bea, bea_id = signed_up("Bea")
     a = enabled_device(pw, owui)
     b = enabled_device(pw, bea)
+    ALL_DEVICES[:] = [a[1], b[1]]
     yield a, b, bea, bea_id
     a[0].close()
     b[0].close()
