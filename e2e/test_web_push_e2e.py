@@ -3128,17 +3128,29 @@ def post(token, channel, content):
     return api(f"/api/v1/channels/{channel}/messages/post", {"content": content}, token)
 
 
-def channel_seen(page, channel, message, n=1):
-    """The service worker's decisions about one channel message: waits for `n`, returns them."""
-    try:
-        page.wait_for_function(
-            "([c, m, n]) => (window.ocPushSeen || []).filter(d => d.payload.channel_id === c && d.payload.message_id === m).length >= n",
-            arg=[channel, message, n], timeout=PUSH_WAIT_MS)
-    except Exception:
-        print(push_diagnostics(page))
-        raise
-    return page.evaluate("([c, m]) => window.ocPushSeen.filter(d => d.payload.channel_id === c && d.payload.message_id === m)",
-                         [channel, message])
+# Open WebUI publishes `channel.message` only for a member with no live socket session: a page connects
+# its socket to every one of its user's channels (socket/main.py `connect`), open or not, in front or not.
+# So a device is "away" here by parking its page on a file of the site: the service worker still runs, no
+# Open WebUI socket is open, and the shown notifications are read from the registration.
+PARKED = "/manifest.json"
+
+
+def park(page):
+    page.goto(BASE + PARKED)
+
+
+def shown(page):
+    return page.evaluate(NOTES)
+
+
+def wait_shown(page, tag):
+    """Waits until a notification with this tag is showing; returns it."""
+    settled(page, f"async () => (await (await navigator.serviceWorker.ready).getNotifications({{tag: {json.dumps(tag)}}})).length > 0")
+    return next(n for n in shown(page) if n["tag"] == tag)
+
+
+def channel_notes(page):
+    return [n for n in shown(page) if n["tag"].startswith("channel-")]
 
 
 def channel_decisions(page):
@@ -3151,7 +3163,6 @@ def pair(owui, pw):
     publish channel events (ui.enable_user_webhooks) and to have channels on."""
     cfg = api("/api/v1/auths/admin/config", token=owui)
     api("/api/v1/auths/admin/config", {**cfg, "ENABLE_CHANNELS": True, "ENABLE_USER_WEBHOOKS": True}, owui)
-    api("/api/v1/auths/update/profile", {"name": SENDER_NAME, "profile_image_url": api("/api/v1/auths/", token=owui)["profile_image_url"]}, owui)
     bea, bea_id = signed_up("Bea")
     a = enabled_device(pw, owui)
     b = enabled_device(pw, bea)
@@ -3162,61 +3173,61 @@ def pair(owui, pw):
 
 def test_channel_messages_push_the_other_members_with_no_text_and_open_the_channel(owui, pair):
     (a_ctx, a_page), (b_ctx, b_page), bea, bea_id = pair
-    a_back = behind(a_ctx, a_page)   # both devices off the screen, as on two phones in pockets
-    b_back = behind(b_ctx, b_page)
+    name = api("/api/v1/auths/", token=owui)["name"]
+    park(a_page)   # both away, as two phones with Open WebUI closed
+    park(b_page)
     # A group channel: Bea gets one, titled by the channel, no text, opening the channel; the sender gets none.
     group = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)["id"]
-    m1 = post(owui, group, f"{CHANNEL_TEXT} first")["id"]
-    (d,) = channel_seen(b_page, group, m1)
-    assert d["shown"] and d["payload"] == {"v": 2, "kind": "channel.message", "source": "api", "channel_id": group,
-                                           "message_id": m1, "title": "#Japan", "url": f"/channels/{group}", "fn": "web_push"}
-    notes = b_page.evaluate(NOTES)
-    assert any(n["tag"] == f"channel-{group}" and n["url"] == f"/channels/{group}" and n["body"] == "New message" for n in notes), notes
-    assert CHANNEL_TEXT not in json.dumps(notes) + json.dumps(d)
-    # The sender's device: a chat reply that follows is the barrier; no channel decision came before it.
+    post(owui, group, f"{CHANNEL_TEXT} first")
+    n = wait_shown(b_page, f"channel-{group}")
+    assert (n["title"], n["body"], n["url"]) == ("#Japan", "New message", f"/channels/{group}"), n
+    assert CHANNEL_TEXT not in json.dumps(shown(b_page))
+    # The sender's device: a chat reply that follows is the barrier; no channel notification came before it.
     chat, msg = new_chat(owui, "stub", "Barrier A")
     reply(owui, "stub", chat, msg)
-    seen_for(a_page, chat)
-    assert channel_decisions(a_page) == []
+    wait_shown(a_page, f"chat-{chat}")
+    assert channel_notes(a_page) == []
 
     # A DM has no name: the sender's name is the title.
     dm = api("/api/v1/channels/create", {"type": "dm", "user_ids": [bea_id]}, owui)["id"]
-    m2 = post(owui, dm, "psst")["id"]
-    (d,) = channel_seen(b_page, dm, m2)
-    assert d["shown"] and d["payload"]["title"] == SENDER_NAME and d["payload"]["url"] == f"/channels/{dm}"
+    post(owui, dm, "psst")
+    n = wait_shown(b_page, f"channel-{dm}")
+    assert (n["title"], n["url"]) == (name, f"/channels/{dm}"), n
 
-    # Muted in Open WebUI: a plain message sends nothing; the @mention of Bea does, once.
+    # Muted in Open WebUI: a plain message sends nothing; the @mention of Bea does, once (a second
+    # push in the channel would stack: its title would count "2 new messages").
+    b_page.evaluate(CLEAR)
     api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": True}, bea)
-    m3 = post(owui, group, "plain, while muted")["id"]
-    m4 = post(owui, group, f"hey <@U:{bea_id}|Bea> a mention")["id"]
-    (d,) = channel_seen(b_page, group, m4)
-    assert d["shown"] and d["payload"]["title"] == "#Japan"
-    assert m3 not in channel_decisions(b_page)
+    post(owui, group, "plain, while muted")
+    post(owui, group, f"hey <@U:{bea_id}|Bea> a mention")
+    n = wait_shown(b_page, f"channel-{group}")
+    assert n["title"] == "#Japan", n
     api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": False}, bea)
 
-    # Opening the channel closes its notification, and while it is open Open WebUI publishes nothing for it.
-    assert any(n["tag"] == f"channel-{group}" for n in b_page.evaluate(NOTES))
+    # With Open WebUI open and connected on the device, Open WebUI publishes nothing; opening the
+    # channel closes its notification.
     b_page.goto(f"{BASE}/channels/{group}")
     b_page.bring_to_front()
     b_page.wait_for_function("async () => !(await (await navigator.serviceWorker.ready).getNotifications({tag: 'channel-%s'})).length" % group,
                              timeout=WAIT_MS)
-    b_page.locator("#message-input-container, #chat-input, [id^='message-input']").first.wait_for(timeout=WAIT_MS)
-    m5 = post(owui, group, "while it is open")["id"]
-    m6 = post(owui, dm, "barrier on another channel")["id"]
-    channel_seen(b_page, dm, m6)
-    assert m5 not in channel_decisions(b_page)
-    b_back = behind(b_ctx, b_page)
+    post(owui, group, "while it is open")
+    b_chat, b_msg = new_chat(bea, "stub", "Barrier open")
+    reply(bea, "stub", b_chat, b_msg)
+    seen_for(b_page, b_chat)
+    assert channel_decisions(b_page) == []
+    assert channel_notes(b_page) == []
 
     # The kill switch (valve CHANNEL_PUSH): nothing for a channel; a reply to a chat still notifies.
+    park(b_page)
+    b_page.evaluate(CLEAR)
     api("/api/v1/functions/id/web_push/valves/update",
         {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com", "CHANNEL_PUSH": False}, owui)
     try:
-        m7 = post(owui, dm, "while the switch is off")["id"]
-        b_chat, b_msg = new_chat(bea, "stub", "Barrier B")
+        post(owui, dm, "while the switch is off")
+        b_chat, b_msg = new_chat(bea, "stub", "Barrier switch")
         reply(bea, "stub", b_chat, b_msg)
-        seen_for(b_page, b_chat)
-        assert m7 not in channel_decisions(b_page)
+        wait_shown(b_page, f"chat-{b_chat}")
+        assert channel_notes(b_page) == []
     finally:
         api("/api/v1/functions/id/web_push/valves/update",
             {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com"}, owui)
-    a_back()
