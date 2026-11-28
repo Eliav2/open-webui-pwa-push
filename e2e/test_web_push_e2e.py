@@ -3091,3 +3091,132 @@ def test_a_reconnecting_socket_with_http_up_sends_at_once(owui, pw):
         assert page.evaluate(OUTBOX_COUNT) in (0, -1)
     finally:
         ctx.close()
+
+
+# --- Channel messages (ELI-548): two users, each with a subscribed device (own Chrome profile) ---
+
+CHANNEL_TEXT = "SECRET-CHANNEL-TEXT"
+SENDER_NAME = "E2E"   # the admin of the stack, who sends
+
+
+def signed_up(name):
+    """A new plain user: (token, id)."""
+    r = api("/api/v1/auths/signup", {"name": name, "email": f"{name.lower()}-{uuid.uuid4().hex[:8]}@e2e.example.com",
+                                     "password": "e2e-pass-2"})
+    return r["token"], r["id"]
+
+
+def enabled_device(pw, token):
+    """A Chrome profile signed in as `token` with notifications allowed and this device subscribed."""
+    ctx, page = own_chrome(pw, token)
+    ctx.add_init_script(DECISIONS)
+    ctx.add_cookies([{"name": "token", "value": token, "url": BASE}])
+    page.goto(BASE + "/")
+    assert ready(page) == "no-permission"
+    ctx.grant_permissions(["notifications"], origin=BASE)
+    ctx.new_cdp_session(ctx.new_page()).send("Browser.setPermission", {
+        "permission": {"name": "push", "userVisibleOnly": True}, "setting": "granted", "origin": BASE})
+    page.bring_to_front()
+    page.get_by_role("button", name="Enable notifications for replies").click()
+    page.wait_for_function("() => window.ocPushState !== 'no-permission'", timeout=WAIT_MS)
+    assert page.evaluate("() => window.ocPushState") == "saved"
+    push_connection_live(ctx, BASE)
+    return ctx, page
+
+
+def post(token, channel, content):
+    return api(f"/api/v1/channels/{channel}/messages/post", {"content": content}, token)
+
+
+def channel_seen(page, channel, message, n=1):
+    """The service worker's decisions about one channel message: waits for `n`, returns them."""
+    try:
+        page.wait_for_function(
+            "([c, m, n]) => (window.ocPushSeen || []).filter(d => d.payload.channel_id === c && d.payload.message_id === m).length >= n",
+            arg=[channel, message, n], timeout=PUSH_WAIT_MS)
+    except Exception:
+        print(push_diagnostics(page))
+        raise
+    return page.evaluate("([c, m]) => window.ocPushSeen.filter(d => d.payload.channel_id === c && d.payload.message_id === m)",
+                         [channel, message])
+
+
+def channel_decisions(page):
+    return page.evaluate("() => window.ocPushSeen.filter(d => d.payload.channel_id).map(d => d.payload.message_id)")
+
+
+@pytest.fixture(scope="module")
+def pair(owui, pw):
+    """Two users (the stack's admin `E2E` and `Bea`), each with a subscribed device; Open WebUI told to
+    publish channel events (ui.enable_user_webhooks) and to have channels on."""
+    cfg = api("/api/v1/auths/admin/config", token=owui)
+    api("/api/v1/auths/admin/config", {**cfg, "ENABLE_CHANNELS": True, "ENABLE_USER_WEBHOOKS": True}, owui)
+    api("/api/v1/auths/update/profile", {"name": SENDER_NAME, "profile_image_url": api("/api/v1/auths/", token=owui)["profile_image_url"]}, owui)
+    bea, bea_id = signed_up("Bea")
+    a = enabled_device(pw, owui)
+    b = enabled_device(pw, bea)
+    yield a, b, bea, bea_id
+    a[0].close()
+    b[0].close()
+
+
+def test_channel_messages_push_the_other_members_with_no_text_and_open_the_channel(owui, pair):
+    (a_ctx, a_page), (b_ctx, b_page), bea, bea_id = pair
+    a_back = behind(a_ctx, a_page)   # both devices off the screen, as on two phones in pockets
+    b_back = behind(b_ctx, b_page)
+    # A group channel: Bea gets one, titled by the channel, no text, opening the channel; the sender gets none.
+    group = api("/api/v1/channels/create", {"name": "Japan", "type": "group", "user_ids": [bea_id]}, owui)["id"]
+    m1 = post(owui, group, f"{CHANNEL_TEXT} first")["id"]
+    (d,) = channel_seen(b_page, group, m1)
+    assert d["shown"] and d["payload"] == {"v": 2, "kind": "channel.message", "source": "api", "channel_id": group,
+                                           "message_id": m1, "title": "#Japan", "url": f"/channels/{group}", "fn": "web_push"}
+    notes = b_page.evaluate(NOTES)
+    assert any(n["tag"] == f"channel-{group}" and n["url"] == f"/channels/{group}" and n["body"] == "New message" for n in notes), notes
+    assert CHANNEL_TEXT not in json.dumps(notes) + json.dumps(d)
+    # The sender's device: a chat reply that follows is the barrier; no channel decision came before it.
+    chat, msg = new_chat(owui, "stub", "Barrier A")
+    reply(owui, "stub", chat, msg)
+    seen_for(a_page, chat)
+    assert channel_decisions(a_page) == []
+
+    # A DM has no name: the sender's name is the title.
+    dm = api("/api/v1/channels/create", {"type": "dm", "user_ids": [bea_id]}, owui)["id"]
+    m2 = post(owui, dm, "psst")["id"]
+    (d,) = channel_seen(b_page, dm, m2)
+    assert d["shown"] and d["payload"]["title"] == SENDER_NAME and d["payload"]["url"] == f"/channels/{dm}"
+
+    # Muted in Open WebUI: a plain message sends nothing; the @mention of Bea does, once.
+    api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": True}, bea)
+    m3 = post(owui, group, "plain, while muted")["id"]
+    m4 = post(owui, group, f"hey <@U:{bea_id}|Bea> a mention")["id"]
+    (d,) = channel_seen(b_page, group, m4)
+    assert d["shown"] and d["payload"]["title"] == "#Japan"
+    assert m3 not in channel_decisions(b_page)
+    api(f"/api/v1/channels/{group}/members/mute", {"is_channel_muted": False}, bea)
+
+    # Opening the channel closes its notification, and while it is open Open WebUI publishes nothing for it.
+    assert any(n["tag"] == f"channel-{group}" for n in b_page.evaluate(NOTES))
+    b_page.goto(f"{BASE}/channels/{group}")
+    b_page.bring_to_front()
+    b_page.wait_for_function("async () => !(await (await navigator.serviceWorker.ready).getNotifications({tag: 'channel-%s'})).length" % group,
+                             timeout=WAIT_MS)
+    b_page.locator("#message-input-container, #chat-input, [id^='message-input']").first.wait_for(timeout=WAIT_MS)
+    m5 = post(owui, group, "while it is open")["id"]
+    m6 = post(owui, dm, "barrier on another channel")["id"]
+    channel_seen(b_page, dm, m6)
+    assert m5 not in channel_decisions(b_page)
+    b_back = behind(b_ctx, b_page)
+
+    # The kill switch (valve CHANNEL_PUSH): nothing for a channel; a reply to a chat still notifies.
+    api("/api/v1/functions/id/web_push/valves/update",
+        {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com", "CHANNEL_PUSH": False}, owui)
+    try:
+        m7 = post(owui, dm, "while the switch is off")["id"]
+        b_chat, b_msg = new_chat(bea, "stub", "Barrier B")
+        reply(bea, "stub", b_chat, b_msg)
+        seen_for(b_page, b_chat)
+        assert m7 not in channel_decisions(b_page)
+    finally:
+        api("/api/v1/functions/id/web_push/valves/update",
+            {"VAPID_PRIVATE_KEY_FILE": "/mnt/keys/vapid_private.pem", "VAPID_SUBJECT": "mailto:e2e@example.com"}, owui)
+    a_back()
