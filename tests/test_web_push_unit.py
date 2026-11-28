@@ -306,6 +306,15 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         async def get_async_db():
             yield None
 
+        # (channel id, user id) of each channel membership; u1 is in ch1 and ch2 unless a test changes it.
+        self.members = {("ch1", "u1"), ("ch2", "u1")}
+        members = self.members
+
+        class Channels:
+            @staticmethod
+            async def get_member_by_channel_and_user_id(channel_id, user_id, db=None):
+                return types.SimpleNamespace(user_id=user_id) if (channel_id, user_id) in members else None
+
         class Folders:
             @staticmethod
             async def get_folders_by_user_id(user_id):
@@ -317,6 +326,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
                 "open_webui.models.chats": types.ModuleType("open_webui.models.chats"),
                 "open_webui.models.folders": types.ModuleType("open_webui.models.folders"),
                 "open_webui.models.chat_views": types.ModuleType("open_webui.models.chat_views"),
+                "open_webui.models.channels": types.ModuleType("open_webui.models.channels"),
                 "open_webui.internal": types.ModuleType("open_webui.internal"),
                 "open_webui.internal.db": types.ModuleType("open_webui.internal.db")}
         mods["open_webui.models.functions"].Functions = Functions
@@ -324,6 +334,7 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         mods["open_webui.models.chats"].Chats = Chats
         mods["open_webui.models.folders"].Folders = Folders
         mods["open_webui.models.chat_views"].ChatViewStates = ChatViewStates
+        mods["open_webui.models.channels"].Channels = Channels
         mods["open_webui.internal.db"].get_async_db = get_async_db
         p = mock.patch.dict(sys.modules, mods)
         p.start()
@@ -619,6 +630,26 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         self.fn.send_all = lambda subs, body, topic, key, subject, chat_id, early=None: calls.append((topic, chat_id)) or set()
         await self.fn.event(channel_message(), __id__="web_push")
         self.assertEqual(calls, [(web_push.channel_topic("ch1"), "channel:ch1")])
+
+    async def test_a_recipient_who_is_not_a_member_gets_nothing(self):
+        """Defence in depth: Open WebUI publishes per member, the function checks it once more."""
+        self.members.clear()
+        with self.assertLogs("openclaw_web_push", "INFO") as logs:
+            await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        self.assertIn("not a member, nothing sent chat_id=channel:ch1", "\n".join(logs.output))
+
+    async def test_a_membership_that_cannot_be_read_sends_nothing(self):
+        """Fail closed: a message to a channel the user may not be in is worse than a missing push."""
+        channels = sys.modules["open_webui.models.channels"].Channels
+
+        async def broken(*a, **k):
+            raise RuntimeError("db down")
+        with mock.patch.object(channels, "get_member_by_channel_and_user_id", staticmethod(broken)):
+            with self.assertLogs("openclaw_web_push", "WARNING") as logs:
+                await self.fn.event(channel_message(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        self.assertIn("membership", "\n".join(logs.output))
 
     async def test_a_message_without_a_recipient_or_channel_sends_nothing(self):
         await self.fn.event(channel_message(user_id=""), __id__="web_push")
